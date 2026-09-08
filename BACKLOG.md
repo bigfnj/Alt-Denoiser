@@ -109,6 +109,11 @@ new `DFState` is built with a hardcoded `100.0f`. Set the knob to 20 dB, change 
 size, and the change-detector computes `abs(20 - 20) < 0.01` and skips the re-apply. The
 engine runs at 100 while the UI and the saved state both still read 20.
 
+**Measured:** with the knob at 0 dB (passthrough), a 440 Hz tone renders at 0.1767 RMS. After
+a re-prepare with the knob untouched it renders at 0.000909, a ratio of 0.005 and a drop of
+about 45 dB. The consequence is worse than a dead control: the plugin silently switches to
+maximum noise reduction and starts destroying content while the UI still reads 0.
+
 Fix: reset `lastAttenLim` in `prepareToPlay`, or pass the current parameter value into
 `df_create` instead of the hardcoded constant.
 
@@ -125,7 +130,10 @@ while audio is still draining, the audio thread can read a stale or half-publish
 `Source/PluginProcessor.cpp:88`, `:124-125`
 
 Only channel 0 is ever read, and channel 1 is overwritten with a copy of the processed
-result. The right channel is discarded rather than summed. Anything panned hard right
+result. The right channel is discarded rather than summed. **Measured:** feeding 440 Hz left
+and 880 Hz right, the input channels differ by 0.440 peak and the output channels are
+bit-identical (max |L-R| = 0.000000). The harness asserts the input diff first, so this cannot
+pass vacuously. Anything panned hard right
 vanishes; an M/S or dual-mic recording loses half its information. This happens on the
 plugin's own declared stereo layout, and neither the UI nor the README mentions it.
 
@@ -152,7 +160,9 @@ in steps of 32, so `min(out_before_read)` is exactly 32 + 480 = 512, which preci
 the request, and fills stop after block 14.
 
 A 48 kHz host whose block size is an exact multiple of 480 escapes completely. That is the
-only escape and it does not survive a sample-rate change. This is the most likely explanation
+only escape and it does not survive a sample-rate change. **Confirmed by the offline harness:**
+at 480 and 960 the output contains zero silent samples past the reported latency; at 512 it
+contains 352, in runs of exactly 32, matching the predicted per-event size. This is the most likely explanation
 for the contradictory reports on upstream issue #7, where one user sees a broken plugin and
 another sees a working one.
 
@@ -165,8 +175,27 @@ part of the latency (see H6).
 
 `setLatencySamples(round(1920 * sr/48000))` is hardcoded. The embedded model is DeepFilterNet3
 **standard**, measured as `sr=48000, hop=480, fft=960, lookahead=2`, giving an algorithmic
-delay of `(960-480) + 2*480 = 1440` samples. So 1920 is 480 samples over the model's own delay
-while omitting both resampler stages.
+delay of `(960-480) + 2*480 = 1440` samples.
+
+**Measured by the offline harness at attenuation 0** (a spectral passthrough, so this isolates
+pipeline delay from model delay), driving a silence-then-burst signal and finding the first
+audible output sample:
+
+| Block size | Pipeline delay | Implied total (pipeline + 1440) | Reported | Error |
+| ---: | ---: | ---: | ---: | ---: |
+| 480 | 4 | 1444 | 1920 | +476 (9.9 ms too much) |
+| 512 | 451 | 1891 | 1920 | +29 |
+| 960 | 4 | 1444 | 1920 | +476 |
+
+This corrects an earlier claim in this document. 1920 is not uniformly wrong: it is nearly
+right at 512-sample blocks and is 476 samples out at 480 and 960. The constant appears to have
+been tuned against one buffer size. The real defect is that the true delay is a function of
+block geometry (4 samples versus 451 of pipeline delay, purely from the FIFO cushion) while
+the report is a constant, so the error swings by 447 samples with a setting the user changes
+freely.
+
+The 4-sample floor at clean geometries is the Catmull-Rom resampler's own group delay for both
+conversion stages combined, which also settles one of the open resampler questions below.
 
 Worse, the steady-state output-FIFO cushion is real undeclared delay that sawtooths across
 the 14-block cycle rather than sitting at a constant:
@@ -467,7 +496,9 @@ the model. Roughly the coverage the comparable Rust project gets from its 28 tes
   locally for the Release profile alone).
 
 **Resampler and latency derivation** (`modules/Resampler/`)
-- The Catmull-Rom group delay per conversion stage, needed to close out H6.
+- ~~The Catmull-Rom group delay per conversion stage, needed to close out H6.~~ **Measured at
+  4 samples total for both stages combined**, via the offline harness at a block size that is a
+  multiple of 480 (where the FIFO cushion is 0, so the residual delay is the resampler alone).
 - Whether the downsampling direction can overrun the buffers from the other side: `maxRatio`
   is `48000/sampleRate`, so at 96 kHz the buffers are sized at half `samplesPerBlock` while
   the 48k-to-96k output direction expands. Needs tracing at 96000 and 192000.

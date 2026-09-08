@@ -148,3 +148,53 @@ target_link_libraries(AltDenoiserPlugin PRIVATE
     juce::juce_gui_extra
 )
 add_dependencies(AltDenoiserPlugin build_libdf)
+
+# ---------------------------------------------------------------------------
+# Offline render harness.
+#
+# pluginval passes this plugin at strictness 5 with every BACKLOG.md defect
+# present, because it validates VST3 well-formedness rather than audio
+# correctness. This target drives AltDenoiserProcessor directly and asserts on
+# the rendered samples. See tests/OfflineTests.cpp.
+# ---------------------------------------------------------------------------
+juce_add_console_app(AltDenoiserTests
+    PRODUCT_NAME "AltDenoiserTests"
+)
+
+target_sources(AltDenoiserTests PRIVATE
+    tests/OfflineTests.cpp
+    Source/PluginProcessor.cpp
+    Source/PluginEditor.cpp
+    Source/DeepFilterNetProcessor.cpp
+)
+
+target_compile_definitions(AltDenoiserTests PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_STANDALONE_APPLICATION=1
+)
+
+if(MSVC)
+    target_compile_options(AltDenoiserTests PRIVATE /bigobj)
+endif()
+
+target_include_directories(AltDenoiserTests PRIVATE
+    ${LIBS_INCLUDE_DIR}
+    ${RESAMPLER_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/Source
+)
+
+target_link_libraries(AltDenoiserTests PRIVATE
+    df
+    AltDenoiserAssets
+    ${RUST_SYSTEM_LIBS}
+    juce::juce_audio_processors
+    juce::juce_audio_utils
+    juce::juce_audio_devices
+    juce::juce_core
+    juce::juce_audio_basics
+    juce::juce_graphics
+    juce::juce_gui_basics
+    juce::juce_gui_extra
+)
+add_dependencies(AltDenoiserTests build_libdf)
