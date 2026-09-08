@@ -99,7 +99,8 @@ private:
     std::vector<float> tempInputFrame;
     std::vector<float> tempOutputFrame;
     bool modelLoaded = false;
-    float lastAttenLim = -1.0f;
+    float lastAttenLim = -1.0f;   // sentinel: forces the first block to apply the real value
+    int preparedBlockSize = 0;    // C5: what the resample buffers were sized for
 
     std::unique_ptr<Resampler<1, 1>> resamplerHandler;
     std::vector<float> resampleInBuffer;

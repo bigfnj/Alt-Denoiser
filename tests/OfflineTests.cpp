@@ -243,7 +243,7 @@ void testAttenuationSurvivesReprepare()
 
     const double ratio = rmsFirst > 0.0 ? rmsAfterReprepare / rmsFirst : 0.0;
     const bool passed = (ratio > 0.9 && ratio < 1.1);
-    record ("attenuation survives re-prepare", "H2", passed, Expect::FailUntilFixed,
+    record ("attenuation survives re-prepare", "H2", passed, Expect::Pass,
             "RMS before " + std::to_string (rmsFirst)
               + ", after " + std::to_string (rmsAfterReprepare)
               + ", ratio " + std::to_string (ratio)
@@ -290,6 +290,50 @@ void testReportedLatencyMatchesMeasured()
               + " samples (at attenuation 0, so this excludes model-dependent delay)");
 }
 
+//==============================================================================
+// T5 / C5 - a host delivering a larger block than it declared must not make the
+// resampler write past the end of buffers sized in prepareToPlay.
+
+void testOversizedBlockIsRefused()
+{
+    AltDenoiserProcessor proc;
+
+    // Declare a small block, then hand over a much larger one.
+    const int declared = 128;
+    const int oversized = declared * 4;
+    proc.setPlayConfigDetails (2, 2, kSampleRate, declared);
+    proc.prepareToPlay (kSampleRate, declared);
+    setAttenuation (proc, 0.0f);
+
+    juce::AudioBuffer<float> buffer (2, oversized);
+    juce::MidiBuffer midi;
+    std::vector<float> before ((size_t) oversized);
+
+    for (int i = 0; i < oversized; ++i)
+    {
+        const auto v = 0.25f * (float) std::sin (juce::MathConstants<double>::twoPi * 440.0 * i / kSampleRate);
+        buffer.setSample (0, i, v);
+        buffer.setSample (1, i, v);
+        before[(size_t) i] = v;
+    }
+
+    proc.processBlock (buffer, midi);
+
+    // The guard passes audio through untouched rather than corrupting the heap.
+    // Without it this call writes past resampleInBuffer; the assertion is that
+    // we survive AND that the signal was not mangled.
+    double maxDelta = 0.0;
+    for (int i = 0; i < oversized; ++i)
+        maxDelta = std::max (maxDelta, (double) std::abs (buffer.getSample (0, i) - before[(size_t) i]));
+
+    const bool passed = (maxDelta < 1.0e-6);
+    record ("oversized block refused safely", "C5", passed, Expect::Pass,
+            "declared " + std::to_string (declared)
+              + ", delivered " + std::to_string (oversized)
+              + ", max |out-in| = " + std::to_string (maxDelta)
+              + " (0 means passed through untouched)");
+}
+
 } // namespace
 
 //==============================================================================
@@ -307,6 +351,7 @@ int main (int argc, char** argv)
     testStereoIsPreserved();
     testAttenuationSurvivesReprepare();
     testReportedLatencyMatchesMeasured();
+    testOversizedBlockIsRefused();
 
     int unexpected = 0;
     for (const auto& r : results)

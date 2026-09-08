@@ -45,6 +45,18 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         modelLoaded = false;
     }
 
+    // H2: initialize() builds a fresh DFState at a hardcoded 100 dB, but
+    // lastAttenLim kept its old value, so the change-detector in processBlock
+    // saw no delta and never re-applied the user's setting. Measured effect: a
+    // knob left at 0 dB rendered a tone 45 dB quieter after a re-prepare, so
+    // the plugin silently applied maximum reduction while the UI read zero.
+    // Resetting the sentinel forces the next block to push the real value.
+    lastAttenLim = -1.0f;
+
+    // C5: remember what we sized the resample buffers for, so processBlock can
+    // refuse a block larger than we allocated instead of writing past the end.
+    preparedBlockSize = samplesPerBlock;
+
     // init resampler
     resamplerHandler = std::make_unique<Resampler<1, 1>>(sampleRate, 48000.0);
     double maxRatio = 48000.0 / sampleRate;
@@ -63,8 +75,20 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
     // safety check
     if (!modelLoaded || dfProcessor == nullptr || !dfProcessor->isReady()) {
-        buffer.clear(); 
-        return; 
+        buffer.clear();
+        return;
+    }
+
+    // C5: the resample buffers were sized from the samplesPerBlock the host
+    // declared in prepareToPlay. A host that then delivers a larger block would
+    // make the resampler write past the end of those vectors: preparing for 128
+    // at 44.1 kHz allocates 267 floats, and a 512-sample block writes 292 floats
+    // (1168 bytes) beyond it. VST3 treats maxSamplesPerBlock as binding, but
+    // nothing here should depend on the host honouring it. Pass the audio
+    // through untouched rather than corrupting the heap.
+    if (buffer.getNumSamples() > preparedBlockSize) {
+        jassertfalse;
+        return;
     }
  
     // input rms
