@@ -17,13 +17,10 @@ jobs:
         include:
           - os: windows-latest
             name: windows
-            path: build/AltDenoiserPlugin_artefacts/Release/
           - os: macos-latest
             name: macos
-            path: build/AltDenoiserPlugin_artefacts/Release/
           - os: ubuntu-latest
             name: linux
-            path: build/AltDenoiserPlugin_artefacts/Release/
 
     runs-on: ${{ matrix.os }}
 
@@ -59,11 +56,37 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel 4
 
+      # Ship only the VST3 bundle. The build tree also contains a ~44 MB
+      # _SharedCode.lib link intermediate and MSVC .exp/.lib stubs, which were
+      # previously published and are unusable to end users.
+      #
+      # The bundle is located rather than hardcoded: the artefacts directory
+      # differs between single- and multi-config generators, and this path has
+      # never been verified on macOS or Linux. Missing or ambiguous results are
+      # a hard failure, because the previous workflow would have silently
+      # published an empty archive.
+      - name: Stage VST3 for packaging
+        shell: bash
+        run: |
+          set -eu
+          count=$(find build -type d -name '*.vst3' -prune -print | wc -l | tr -d ' ')
+          if [ "$count" != "1" ]; then
+            echo "::error::expected exactly one .vst3 bundle in build/, found $count"
+            find build -maxdepth 3 -type d || true
+            exit 1
+          fi
+          bundle=$(find build -type d -name '*.vst3' -prune -print)
+          echo "Found bundle: $bundle"
+          mkdir -p dist
+          cp -R "$bundle" dist/
+          find dist -type f -print
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Alt-Denoiser-${{ matrix.name }}
-          path: ${{ matrix.path }}
+          path: dist/
+          if-no-files-found: error
 
   release:
     needs: build

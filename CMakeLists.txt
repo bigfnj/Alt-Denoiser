@@ -15,7 +15,6 @@ endif()
 set(JUCE_DIR          ${CMAKE_SOURCE_DIR}/modules/JUCE)
 set(RESAMPLER_DIR     ${CMAKE_SOURCE_DIR}/modules/Resampler)
 set(DFNET_DIR         ${CMAKE_SOURCE_DIR}/modules/DeepFilterNet)
-set(VST2_SDK_DIR      ${CMAKE_SOURCE_DIR}/modules/plugin_sdk/vstsdk2.4)
 set(LIBDF_CARGO_DIR   ${DFNET_DIR}/libDF)
 set(TARGET_RELEASE_DIR ${DFNET_DIR}/target/release)
 set(LIBS_DIR          ${CMAKE_SOURCE_DIR}/libs)
@@ -87,8 +86,10 @@ juce_add_binary_data(AltDenoiserAssets
 )
 
 # format
-juce_set_vst2_sdk_path(${VST2_SDK_DIR})
-set(PLUGIN_FORMATS VST3 Standalone VST)
+# VST2 removed: Steinberg stopped issuing VST2 SDK licences in October 2018, so
+# distributing VST2 builds is a legal risk regardless of whether they compile.
+# The SDK was previously supplied by a third-party mirror submodule.
+set(PLUGIN_FORMATS VST3 Standalone)
 if(APPLE)
     list(APPEND PLUGIN_FORMATS AU)
 elseif(UNIX AND NOT APPLE)
