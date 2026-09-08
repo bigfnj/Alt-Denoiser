@@ -337,6 +337,49 @@ void testOversizedBlockIsRefused()
               + " (0 means passed through untouched)");
 }
 
+//==============================================================================
+// T6 / H7 - an unusable plugin must pass audio through, never mute the track.
+//
+// The old code called buffer.clear() whenever the model was unavailable, so a
+// failure to stage the model silently killed the track with no UI indication.
+// This drives processBlock with no prepareToPlay first, which is reachable
+// during host scanning and leaves the plugin in exactly that unusable state.
+
+void testUnpreparedPassesAudioThrough()
+{
+    AltDenoiserProcessor proc;
+    proc.setPlayConfigDetails (2, 2, kSampleRate, kBlockSize);
+    // deliberately NO prepareToPlay
+
+    juce::AudioBuffer<float> buffer (2, kBlockSize);
+    juce::MidiBuffer midi;
+    std::vector<float> before ((size_t) kBlockSize);
+
+    for (int i = 0; i < kBlockSize; ++i)
+    {
+        const auto v = 0.25f * (float) std::sin (juce::MathConstants<double>::twoPi * 440.0 * i / kSampleRate);
+        buffer.setSample (0, i, v);
+        buffer.setSample (1, i, v);
+        before[(size_t) i] = v;
+    }
+
+    proc.processBlock (buffer, midi);
+
+    double maxDelta = 0.0, outPeak = 0.0;
+    for (int i = 0; i < kBlockSize; ++i)
+    {
+        const auto out = (double) buffer.getSample (0, i);
+        maxDelta = std::max (maxDelta, std::abs (out - before[(size_t) i]));
+        outPeak  = std::max (outPeak, std::abs (out));
+    }
+
+    const bool passed = (outPeak > 0.01) && (maxDelta < 1.0e-6);
+    record ("unprepared passes audio through", "H7", passed, Expect::Pass,
+            "output peak " + std::to_string (outPeak)
+              + ", max |out-in| = " + std::to_string (maxDelta)
+              + " (peak 0 means the track was muted)");
+}
+
 } // namespace
 
 //==============================================================================
@@ -355,6 +398,7 @@ int main (int argc, char** argv)
     testAttenuationSurvivesReprepare();
     testReportedLatencyMatchesMeasured();
     testOversizedBlockIsRefused();
+    testUnpreparedPassesAudioThrough();
 
     int unexpected = 0;
     for (const auto& r : results)

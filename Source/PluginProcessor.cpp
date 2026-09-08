@@ -91,11 +91,13 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
 
-    // safety check
-    if (!modelLoaded || dfProcessor == nullptr || !dfProcessor->isReady()) {
-        buffer.clear();
-        return;
-    }
+    // H7: when the model is unavailable, pass audio through unchanged rather
+    // than calling buffer.clear(). Muting the track reads as a broken DAW and
+    // gives the user nothing to diagnose; a denoiser that cannot load should
+    // simply not denoise. The meters are still updated below so the UI shows
+    // signal arriving and leaving, instead of freezing at their last values and
+    // making a silent plugin look healthy.
+    const bool modelAvailable = modelLoaded && dfProcessor != nullptr && dfProcessor->isReady();
 
     // C5: the resample buffers were sized from the samplesPerBlock the host
     // declared in prepareToPlay. A host that then delivers a larger block would
@@ -120,6 +122,8 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // clear and parameter update
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear(i, 0, buffer.getNumSamples());
+
+  if (modelAvailable) {
     float newAttenLim = *apvts.getRawParameterValue("atten_lim");
     if (std::abs(newAttenLim - lastAttenLim) > 0.01f) {
         dfProcessor->setAttenLim(newAttenLim);
@@ -185,6 +189,7 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // Fan the mono wet result back out to every output channel.
     for (int ch = 0; ch < totalNumOutputChannels; ++ch)
         juce::FloatVectorOperations::copy(buffer.getWritePointer(ch), monoBuffer.data(), hostNumSamples);
+  }   // if (modelAvailable); otherwise the buffer passes through untouched
 
     // output RMS
     float currentOutRMS = 0.0f;
