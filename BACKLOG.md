@@ -28,6 +28,11 @@ These terminate the host process or corrupt memory.
 
 ### C1. A bad model file aborts the DAW instead of failing gracefully
 
+**MITIGATED, NOT CLOSED** (`388abbe`). The archive is now validated for write success and exact
+size before the path reaches Rust, so recoverable I/O errors fail here instead of panicking. A
+genuinely corrupt archive still aborts the host. Closing this needs a non-panicking entry point
+in `capi.rs`, which is a change to the vendored DeepFilterNet submodule.
+
 `Source/DeepFilterNetProcessor.cpp:43-44`
 
 `df_create` can never return `NULL`. In the pinned `libDF/src/capi.rs`, `DFState::new`
@@ -53,6 +58,9 @@ audio callback. Same abort-on-unwind path as C1.
 
 ### C3. Fixed shared temp-file path makes C1 reachable in normal use  — Upstream
 
+**FIXED** (`388abbe`). Staged via `juce::File::createTempFile`, so every instance and process gets
+a unique path.
+
 `Source/DeepFilterNetProcessor.cpp:29-30`
 
 The model is written to `tempDir/alt_denoiser_model.tar.gz`, a constant name shared by every
@@ -65,6 +73,10 @@ Fix: `juce::TemporaryFile`, or skip the filesystem entirely per M4.
 
 ### C4. The temp file appends instead of truncating — Upstream
 
+**FIXED** (`388abbe`). Written fresh and deleted as soon as `df_create` has read it, which also
+closes M6. Confirmed in the wild: `%TEMP%lt_denoiser_model.tar.gz` had reached 582,768,928
+bytes, exactly 73 x 7,983,136, purely from this session's test runs. Deleted.
+
 `Source/DeepFilterNetProcessor.cpp:32-41`
 
 JUCE's `FileOutputStream` sets the write position to end-of-file and the code never calls
@@ -75,6 +87,10 @@ panics and aborts the DAW until the user manually deletes the file. The file als
 7,983,136 bytes per `initialize()` call and is never deleted.
 
 ### C5. Heap overrun when a host exceeds its declared block size
+
+**FIXED** (`388abbe`). processBlock refuses a block larger than `preparedBlockSize` and passes
+audio through untouched. Mutation-tested: with the guard disabled the harness terminates with
+`0xC0000374`, `STATUS_HEAP_CORRUPTION`, confirming the overflow was real and reachable.
 
 `Source/PluginProcessor.cpp:51-53`, written at `:88-89` and `:119`
 
@@ -93,6 +109,8 @@ VST2's `effSetBlockSize` is advisory, and this project builds VST2 unconditional
 
 ### H1. Every `prepareToPlay` leaks an entire model — Upstream
 
+**FIXED** (`388abbe`). `initialize()` frees the previous `DFState` before replacing it.
+
 `Source/DeepFilterNetProcessor.cpp:43`
 
 `state = df_create(...)` with no prior `df_free` and no guard. `releaseResources()` is empty,
@@ -100,6 +118,9 @@ so the only free is in the destructor, and only for the last instance. Every sam
 buffer-size change leaks a full ONNX session plus weights.
 
 ### H2. The attenuation knob stops working after any re-prepare — Upstream
+
+**FIXED** (`388abbe`). `prepareToPlay` resets `lastAttenLim` to its sentinel. Harness now
+measures RMS 0.176713 before and after a re-prepare, ratio exactly 1.000000.
 
 `Source/PluginProcessor.h:102`, `Source/PluginProcessor.cpp:82`,
 `Source/DeepFilterNetProcessor.cpp:43`
@@ -127,6 +148,10 @@ while audio is still draining, the audio thread can read a stale or half-publish
 
 ### H4. Stereo input is destroyed
 
+**FIXED** (`9fd5b6f`), partially. Inputs are summed to `(L+R)/2` so nothing is discarded before
+inference. Output remains mono, which is inherent to a one-channel model. True stereo via two
+model instances is still open; see the note at the end of this item.
+
 `Source/PluginProcessor.cpp:88`, `:124-125`
 
 Only channel 0 is ever read, and channel 1 is overwritten with a copy of the processed
@@ -142,6 +167,10 @@ signal, or run two inference streams, or redeclare the bus as mono-in/stereo-out
 behaviour is at least honest.
 
 ### H5. A zero-splice at the top of every playback
+
+**FIXED** (`960cd5f`). The output FIFO is primed with one model hop of silence, which bounds the
+worst-case deficit. Zero spliced samples measured across 48000/480, 48000/512, 48000/1024,
+44100/512, 44100/480 and 96000/1024.
 
 `Source/PluginProcessor.cpp:112-120`
 
@@ -170,6 +199,10 @@ Fix: hold the FIFO at a fixed target fill before producing output, and declare t
 part of the latency (see H6).
 
 ### H6. Reported latency is wrong, and no single constant can be correct
+
+**FIXED** (`960cd5f`). The same priming makes the delay deterministic. The reported 1920 needed no
+change: it was always 1440 of model delay plus 480 of cushion, and only the priming was missing.
+Measured error after the fix is 1-4 samples across six rate/block combinations.
 
 `Source/PluginProcessor.cpp:39-40`
 
@@ -214,6 +247,10 @@ Fixing H5 by holding a fixed target fill also makes this number well-defined.
 
 ### H7. Load failure produces silence instead of bypass, and the meters conceal it
 
+**FIXED** (`1b74600`). Audio passes through untouched when the model is unavailable, and the meter
+updates moved outside that gate so the UI shows real signal instead of freezing. Mutation-tested:
+restoring `buffer.clear()` makes the harness fail with output peak 0.000000 and exit 1.
+
 `Source/PluginProcessor.cpp:65-68`, with `Source/PluginEditor.h:57`
 
 `buffer.clear(); return;` mutes the track. Given C1, this path is reachable only through a
@@ -241,13 +278,13 @@ latency.
 | M3 | `libs/Include/df.h:25` | `df_get_frame_length` is declared but never called; 480 is hardcoded in five places. `df_process_frame` builds its views with `from_shape_ptr`, which does no bounds check, and the guarding `debug_assert` is compiled out in release. Any model swap becomes silent heap corruption. |
 | M4 | `CMakeLists.txt:86` | The model is embedded twice at source level, because `--features capi` also enables `default-model`, so libDF carries its own `include_bytes!` copy alongside the `juce_add_binary_data` one. **Measured: this does not reach the shipped binary.** The 7,983,136-byte archive appears exactly once in the released VST3 and once in the Standalone, so the linker drops the unreferenced copy. The cost is build time and intermediate size, not distribution size. It becomes real bloat the moment anything references `DfParams::default()`. Separately, `DfParams::from_bytes` would load the embedded copy with no filesystem involvement, deleting C3, C4 and M6 outright, but the pinned C API exposes only the path-based `df_create`, so that needs one new entry point upstream. |
 | M5 | `PluginProcessor.h:62` | `getTailLengthSeconds()` returns 0.0 despite roughly 40-50 ms of held state, so offline bounces can truncate the tail. |
-| M6 | `DeepFilterNetProcessor.cpp:29-41` | The temp file is never deleted and grows by ~8 MB per `initialize()`, persisting across DAW restarts. |
+| M6 | `DeepFilterNetProcessor.cpp:29-41` | **FIXED** (`388abbe`) with C4. Was: the temp file is never deleted and grows by ~8 MB per `initialize()`, persisting across DAW restarts. |
 | M7 | `PluginProcessor.h` | No bypass parameter and no `processBlockBypassed`. Un-bypassing flushes stale pre-bypass audio and re-triggers the H5 splice. |
 | M8 | `PluginProcessor.h:16-35` | `SimpleFifo` has no capacity check on `push`, no floor on `discard`, and a signed/unsigned comparison at `:22` that converts a negative count into a full FIFO. Not reachable through current call sites because the guards live in the callers, but the class is unsafe as written. |
 | M9 | `PluginEditor.h:54-70` | Meter ballistics decay at -116 dB/s against -20 to -26 dB/s for a standard digital peak meter, with no `dt` term, on a timer JUCE documents as imprecise at exactly this timescale. |
 | M10 | `PluginProcessor.cpp:71-76` | The audio-side RMS EMA is applied once per block, so its time constant swings 32x with buffer size (1.9 ms at 64 samples, 61.6 ms at 2048). At small buffers roughly 92% of blocks are never sampled by the 60 Hz UI. A running max reset by the UI after reading would drop nothing. |
 | M11 | `PluginEditor.h:100`, `:152` | The meter bar reads from `smoothedLevel` and the number printed above it from `displayedDb`, on different decay rates, so they disagree after every transient. |
-| M12 | `PluginProcessor.h:47-110` | No `isBusesLayoutSupported`. Mono is genuinely safe (every index traced and guarded), but any layout with 3 or more outputs leaves channels 2 and up unprocessed and undelayed while the host shifts the whole track by the reported latency. |
+| M12 | `PluginProcessor.h:47-110` | **FIXED** (`9fd5b6f`); pluginval now reports only `Mono, Stereo`. Was: no `isBusesLayoutSupported`. Mono is genuinely safe (every index traced and guarded), but any layout with 3 or more outputs leaves channels 2 and up unprocessed and undelayed while the host shifts the whole track by the reported latency. |
 | M13 | `PluginProcessor.cpp:21-28` | The parameter has no unit label and no string-from-value function, so hosts show a bare "20.0"; the automation lane reads "Attenuation Limit" while the visible knob reads "Reduction"; and 100 is an undocumented sentinel meaning "no limit". |
 
 ---

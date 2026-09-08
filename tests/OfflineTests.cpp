@@ -5,13 +5,16 @@
     BACKLOG.md present, because it checks that the plugin is a well-formed VST3
     rather than that it processes audio correctly. These tests check the audio.
 
-    They are CHARACTERISATION tests: several are expected to fail against the
-    current code, and each names the backlog item it pins down. A failure here
-    is the bug being detected, not the harness being wrong. As each item is
-    fixed, the corresponding EXPECT flips to pass and becomes a regression test.
+    Each test names the backlog item it pins down. Tests start life as
+    CHARACTERISATION tests, declared Expect::FailUntilFixed so the harness stays
+    green while a known defect is still known, and are flipped to Expect::Pass
+    once the item is fixed, at which point they become regression tests. All of
+    them currently pass; the mechanism is kept for the items still open.
 
-    Run:  AltDenoiserTests[.exe]
-    Exit: 0 if every test matched its expectation, 1 otherwise.
+    Run:  AltDenoiserTests[.exe] [blockSize] [sampleRate]
+    Exit: 0 if every test matched its expectation, 1 otherwise. A test that
+          starts passing without its Expect being updated is also reported, so
+          a silently-fixed defect cannot go unnoticed.
 */
 
 #include <juce_audio_processors/juce_audio_processors.h>
@@ -151,11 +154,6 @@ void testStartupZeroSplice()
     const int zerosAfterLatency = countZeros (out, latency, (int) out.size());
     const int worstRun = longestZeroRun (out, latency);
 
-    // Measured: a 48 kHz host whose block size is an exact multiple of the
-    // 480-sample model hop drains the output FIFO evenly and never underruns.
-    // Every other geometry splices silence in during startup. So the expected
-    // result is configuration-dependent, and saying so keeps a clean run at
-    // 480 or 960 from looking like the bug was fixed.
     // Before the fix this was geometry-dependent: clean at 480 and 960, and
     // 448 spliced samples at 512. Priming the output FIFO with one hop removes
     // the dependence, so every geometry is now expected to be clean.
