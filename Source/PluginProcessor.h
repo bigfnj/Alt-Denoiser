@@ -53,6 +53,12 @@ public:
     void releaseResources() override;
     void processBlock(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
 
+    // M12: without this the base class accepts anything, and pluginval confirmed
+    // the plugin was advertising Mono through 7.1 Surround on both buses. On a
+    // 5.1 instantiation channels 2-5 passed through un-denoised and undelayed
+    // while the host shifted the track by the reported latency.
+    bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
+
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
     const juce::String getName() const override { return "Alt Denoiser"; }
@@ -105,6 +111,7 @@ private:
     std::unique_ptr<Resampler<1, 1>> resamplerHandler;
     std::vector<float> resampleInBuffer;
     std::vector<float> resampleOutBuffer;
+    std::vector<float> monoBuffer;   // H4: host-rate mono sum fed to the model
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AltDenoiserProcessor)

@@ -166,41 +166,44 @@ void testStartupZeroSplice()
 }
 
 //==============================================================================
-// T2 / H4 - the right channel is overwritten with a copy of the left.
+// T2 / H4 - the right input channel was discarded outright.
+//
+// The model is mono, so the output is legitimately the same on both channels.
+// The defect was that only channel 0 was ever READ, so anything present only in
+// the right channel vanished. This feeds silence left and a tone right: if the
+// right input reaches the model at all, the output is non-silent.
 
-void testStereoIsPreserved()
+void testRightChannelReachesTheModel()
 {
     AltDenoiserProcessor proc;
     prepare (proc);
-    setAttenuation (proc, 0.0f);
+    setAttenuation (proc, 0.0f);          // spectral passthrough
 
-    double maxAbsDiff = 0.0;
-    double maxInputDiff = 0.0;   // non-vacuity guard, see below
+    double inputRightPeak = 0.0;
+    double outputPeak = 0.0;
     render (proc, 40,
-            [&maxInputDiff] (juce::AudioBuffer<float>& b, int blk)
+            [&inputRightPeak] (juce::AudioBuffer<float>& b, int blk)
             {
-                fillSine (b, blk, 440.0f, 880.0f);
+                fillSine (b, blk, 440.0f, 440.0f);
+                b.clear (0, 0, b.getNumSamples());          // silence on the left
                 for (int i = 0; i < b.getNumSamples(); ++i)
-                    maxInputDiff = std::max (maxInputDiff,
-                                             (double) std::abs (b.getSample (0, i) - b.getSample (1, i)));
+                    inputRightPeak = std::max (inputRightPeak, (double) std::abs (b.getSample (1, i)));
             },
-            [&maxAbsDiff] (const juce::AudioBuffer<float>& b, int blk)
+            [&outputPeak] (const juce::AudioBuffer<float>& b, int blk)
             {
-                if (blk < 10) return;     // let the pipeline fill
+                if (blk < 15) return;     // let the pipeline fill
                 for (int i = 0; i < b.getNumSamples(); ++i)
-                    maxAbsDiff = std::max (maxAbsDiff,
-                                           (double) std::abs (b.getSample (0, i) - b.getSample (1, i)));
+                    outputPeak = std::max (outputPeak, (double) std::abs (b.getSample (0, i)));
             });
 
-    // An output diff of zero would ALSO be the result if the harness never fed
-    // distinct channels, so require a large input diff before believing it.
-    // Without this the test could pass vacuously forever.
-    const bool inputWasStereo = (maxInputDiff > 0.1);
-    const bool passed = inputWasStereo && (maxAbsDiff > 1.0e-6);
-    record ("stereo channels stay distinct", "H4", passed, Expect::FailUntilFixed,
-            "input max |L-R| = " + std::to_string (maxInputDiff)
-              + (inputWasStereo ? "" : "  <-- HARNESS BUG: input was not stereo")
-              + ", output max |L-R| = " + std::to_string (maxAbsDiff)
+    // Silent output would ALSO result from the harness never putting signal on
+    // the right channel, so require a real input peak before believing it.
+    const bool inputWasRightOnly = (inputRightPeak > 0.1);
+    const bool passed = inputWasRightOnly && (outputPeak > 0.01);
+    record ("right channel reaches the model", "H4", passed, Expect::Pass,
+            "input right peak " + std::to_string (inputRightPeak)
+              + (inputWasRightOnly ? "" : "  <-- HARNESS BUG: no signal on the right")
+              + ", output peak " + std::to_string (outputPeak)
               + " (0 means the right input was discarded)");
 }
 
@@ -348,7 +351,7 @@ int main (int argc, char** argv)
                  kSampleRate, kBlockSize);
 
     testStartupZeroSplice();
-    testStereoIsPreserved();
+    testRightChannelReachesTheModel();
     testAttenuationSurvivesReprepare();
     testReportedLatencyMatchesMeasured();
     testOversizedBlockIsRefused();

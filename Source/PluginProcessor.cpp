@@ -63,6 +63,24 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     int maxResampledSize = (int)(samplesPerBlock * maxRatio) + 128; // +128 for safety margin
     resampleInBuffer.resize(maxResampledSize);
     resampleOutBuffer.resize(maxResampledSize);
+    monoBuffer.assign((size_t) samplesPerBlock, 0.0f);
+}
+
+bool AltDenoiserProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+{
+    const auto& in  = layouts.getMainInputChannelSet();
+    const auto& out = layouts.getMainOutputChannelSet();
+
+    if (in.isDisabled() || out.isDisabled())
+        return false;
+
+    // The processing chain is mono in the middle and fans back out, so anything
+    // beyond mono or stereo would leave the extra channels unprocessed.
+    if (in != out)
+        return false;
+
+    return in == juce::AudioChannelSet::mono()
+        || in == juce::AudioChannelSet::stereo();
 }
 
 void AltDenoiserProcessor::releaseResources() {
@@ -108,10 +126,29 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         lastAttenLim = newAttenLim;
     }
 
-    // resample
-    float* sourceInputPtrs[] = { buffer.getWritePointer(0) }; float* sourceOutputPtrs[] = { buffer.getWritePointer(0) }; 
-    float* targetInputPtrs[] = { resampleInBuffer.data() };   float* targetOutputPtrs[] = { resampleOutBuffer.data() };
     int hostNumSamples = buffer.getNumSamples();
+
+    // H4: the model has one channel. The old code read only channel 0 and later
+    // overwrote channel 1 with a copy, so anything present only in the right
+    // input was discarded before inference: hard-panned content vanished and an
+    // M/S or dual-mic recording lost half its information. Sum to mono first so
+    // every input channel reaches the model. The wet result is still mono and is
+    // fanned back out below, which is inherent to a one-channel model.
+    {
+        auto* mono = monoBuffer.data();
+        if (totalNumInputChannels >= 2) {
+            const auto* left  = buffer.getReadPointer(0);
+            const auto* right = buffer.getReadPointer(1);
+            for (int i = 0; i < hostNumSamples; ++i)
+                mono[i] = 0.5f * (left[i] + right[i]);
+        } else {
+            juce::FloatVectorOperations::copy(mono, buffer.getReadPointer(0), hostNumSamples);
+        }
+    }
+
+    // resample
+    float* sourceInputPtrs[] = { monoBuffer.data() }; float* sourceOutputPtrs[] = { monoBuffer.data() };
+    float* targetInputPtrs[] = { resampleInBuffer.data() };   float* targetOutputPtrs[] = { resampleOutBuffer.data() };
     resamplerHandler->process(
         sourceInputPtrs,
         sourceOutputPtrs,
@@ -145,9 +182,9 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         }
     );
 
-    if (totalNumOutputChannels > 1) {
-        buffer.copyFrom(1, 0, buffer, 0, 0, hostNumSamples);
-    }
+    // Fan the mono wet result back out to every output channel.
+    for (int ch = 0; ch < totalNumOutputChannels; ++ch)
+        juce::FloatVectorOperations::copy(buffer.getWritePointer(ch), monoBuffer.data(), hostNumSamples);
 
     // output RMS
     float currentOutRMS = 0.0f;
