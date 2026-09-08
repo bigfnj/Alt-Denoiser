@@ -48,13 +48,57 @@ jobs:
             libxext-dev \
             libxinerama-dev \
             libxrandr-dev \
-            libxrender-dev
+            libxrender-dev \
+            xvfb
 
+      # libDF is rebuilt from scratch on every run otherwise, measured at 2m37s
+      # locally for the Release profile alone.
+      - name: Cache libDF build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            modules/DeepFilterNet/target
+          key: ${{ runner.os }}-libdf-${{ hashFiles('modules/DeepFilterNet/libDF/Cargo.toml', 'modules/DeepFilterNet/libDF/src/**') }}
+          restore-keys: ${{ runner.os }}-libdf-
+
+      # Note on the two build-type flags: they are not redundant. CMake reports
+      # CMAKE_BUILD_TYPE as unused on multi-config generators (Windows, Xcode),
+      # and --config is the no-op on single-config ones (Linux). Each covers the
+      # generator the other misses.
       - name: Configure CMake
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release --parallel 4
+
+      # pluginval passes this plugin at strictness 5 with serious audio defects
+      # present, because it validates VST3 well-formedness rather than audio
+      # correctness. This harness renders audio and asserts on the samples.
+      - name: Run offline harness
+        shell: bash
+        run: |
+          set -eu
+          exe=$(find build -type f \( -name AltDenoiserTests -o -name AltDenoiserTests.exe \) | head -n 1)
+          if [ -z "$exe" ]; then
+            echo "::error::AltDenoiserTests binary not found"
+            find build -name 'AltDenoiser*' -maxdepth 4 || true
+            exit 1
+          fi
+          echo "Harness: $exe"
+
+          # JUCE initialises a MessageManager, which needs a display on Linux.
+          RUN=""
+          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; fi
+
+          # Cover the geometries that used to behave differently: a block size
+          # that is a multiple of the 480-sample model hop, one that is not, and
+          # rates that require real resampling in both directions.
+          for cfg in "480 48000" "512 48000" "1024 48000" "512 44100" "1024 96000"; do
+            echo "--- block/rate: $cfg ---"
+            $RUN "$exe" $cfg
+          done
 
       # Ship only the VST3 bundle. The build tree also contains a ~44 MB
       # _SharedCode.lib link intermediate and MSVC .exp/.lib stubs, which were
