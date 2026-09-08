@@ -411,27 +411,60 @@ Recorded so these are not "fixed" into breakage later.
 
 Two domains were not audited. Open questions:
 
-**Build system** (`CMakeLists.txt`)
-- Whether JUCE 8 can build VST2 at all, given `FORMATS VST` at `:91` and
-  `juce_set_vst2_sdk_path` at `:90`. This decides whether the CI matrix is currently green by
-  luck. Note `modules/plugin_sdk` is a third-party mirror of an SDK Steinberg stopped
-  licensing in 2018, and is a distribution risk independent of whether it builds.
-- Whether the link step can race ahead of the Rust staticlib under `--parallel`, given
-  `add_custom_target(build_libdf ALL)` plus `add_dependencies` on an IMPORTED target.
-- Whether CMake rebuilds when Rust sources change (`BYPRODUCTS` correctness).
-- The MSVC Debug/Release CRT mismatch, since cargo is always invoked `--release`.
-- Whether `RUST_SYSTEM_LIBS` is complete per platform.
+**Build system** (`CMakeLists.txt`) — RESOLVED 2026-09-08 by building locally on Windows
+(MSVC 19.51, Visual Studio generator). Both Release and Debug configurations built clean,
+exit 0, zero errors.
+
+- VST2 under JUCE 8: moot, the format was removed.
+- `build_libdf` racing the link under `--parallel`: **not an issue.** Cargo completed well
+  before the link step, and `add_dependencies(AltDenoiserPlugin build_libdf)` enforces
+  ordering in any generator, not just the IMPORTED `df` target.
+- MSVC Debug/Release CRT mismatch: **no warnings observed.** No `LNK4098`, no `defaultlib`
+  conflict, in either configuration. It is also safe by design rather than by luck: ownership
+  never crosses the CRT boundary, because the C++ side only ever returns pointers to
+  `df_free` and never frees Rust-allocated memory itself.
+- `RUST_SYSTEM_LIBS` completeness on Windows: confirmed, both configurations linked.
+- `-DCMAKE_BUILD_TYPE` plus `--config`: **correct, not redundant.** CMake warned that
+  `CMAKE_BUILD_TYPE` was unused because the Windows generator is multi-config, which means
+  single-config generators on Linux need it and multi-config ones need `--config`. The
+  workflow passing both is what makes the matrix work.
+- Still open: `BYPRODUCTS` correctness (whether CMake rebuilds when Rust sources change), and
+  everything above re-verified on macOS and Linux runners.
+
+**Validation** — `pluginval` 1.0.3 at strictness level 5, run 2026-09-08 against the Release
+VST3: **PASS, exit 0, zero warnings.**
+
+That result is important mainly for what it does *not* mean. It passed with every finding in
+this backlog present. It did not detect H1 (the leak), H2 (the dead knob), H4 (the stereo
+collapse), H5 (the startup splice), or C1 (a corrupt model aborting the host). `pluginval`
+verifies that the plugin is a well-formed VST3, not that it processes audio correctly, so it
+is a necessary gate and not a sufficient one.
+
+It did confirm two findings empirically:
+- **M12 upgrades to CONFIRMED-reachable.** `pluginval` enumerated the advertised layouts as
+  Mono, Stereo, LCR, Quadraphonic, 5.0, 5.1, 7.0 and 7.1 on both input and output, and
+  successfully enabled all of them. The missing `isBusesLayoutSupported` is therefore not
+  hypothetical: a 5.1 instantiation is accepted, and channels 2-5 pass through un-denoised
+  and undelayed while the host shifts the track by the reported latency.
+- **M5 confirmed:** `Reported taillength: 0`.
+
+**Consequence for the plan.** There is currently no way to detect a regression in the audio
+path, and every Phase 2 fix touches it. An offline render harness is needed before changing
+DSP code: a console target linking the processor directly, driving `prepareToPlay` and
+`processBlock` with known input, and asserting impulse position against reported latency,
+absence of zero-runs in steady state, right-channel survival, and that the parameter reaches
+the model. Roughly the coverage the comparable Rust project gets from its 28 tests.
 
 **CI** (`.github/workflows/build.yml`)
 - No `pluginval` and no `auval` on any platform, so nothing in this backlog is currently
-  caught before release.
-- Whether the artifact path `build/AltDenoiserPlugin_artefacts/Release/` is correct on all
-  three runners, given the workflow passes both `-DCMAKE_BUILD_TYPE=Release` (single-config)
-  and `--config Release` (multi-config), and given `project()` is `AltDenoiser` while the
-  plugin target is `AltDenoiserPlugin`. The path demonstrably resolves on Windows, since
-  `v1.0.1` published a populated zip (see PKG1), but no macOS or Linux release has ever been
-  published, so those two remain unverified.
-- No Rust build caching, so every run recompiles libDF from scratch.
+  caught before release. Adding `pluginval` is worth doing but see the caveat above about
+  what it does and does not detect.
+- The artefacts path is no longer hardcoded: the staging step added in `a01cd73` locates the
+  bundle and hard-fails on zero or multiple matches, so a wrong path on macOS or Linux now
+  breaks the build loudly instead of publishing an empty archive. Confirmed working against a
+  real Windows build tree.
+- No Rust build caching, so every run recompiles libDF from scratch (measured at 2m37s
+  locally for the Release profile alone).
 
 **Resampler and latency derivation** (`modules/Resampler/`)
 - The Catmull-Rom group delay per conversion stage, needed to close out H6.

@@ -1,6 +1,8 @@
 libs/libDF/*
 modules/*/target/
 build/
+build-*/
 bin/
+dist/
 *.dll *.lib *.a *.exp *.ilk *.pdb
 .DS_Store
