@@ -156,10 +156,11 @@ void testStartupZeroSplice()
     // Every other geometry splices silence in during startup. So the expected
     // result is configuration-dependent, and saying so keeps a clean run at
     // 480 or 960 from looking like the bug was fixed.
-    const bool cleanGeometry = (kBlockSize % 480) == 0;
+    // Before the fix this was geometry-dependent: clean at 480 and 960, and
+    // 448 spliced samples at 512. Priming the output FIFO with one hop removes
+    // the dependence, so every geometry is now expected to be clean.
     const bool passed = (zerosAfterLatency == 0);
-    record ("startup zero-splice", "H5", passed,
-            cleanGeometry ? Expect::Pass : Expect::FailUntilFixed,
+    record ("startup zero-splice", "H5", passed, Expect::Pass,
             "reported latency " + std::to_string (latency)
               + ", zero samples after it " + std::to_string (zerosAfterLatency)
               + ", longest zero run " + std::to_string (worstRun));
@@ -285,12 +286,21 @@ void testReportedLatencyMatchesMeasured()
         if (std::abs (out[(size_t) i]) > 0.01f) { firstAudible = i; break; }
 
     const int measured = firstAudible >= 0 ? firstAudible - burstStart : -1;
-    const bool passed = (measured >= 0 && std::abs (measured - reported) <= 32);
-    record ("reported latency matches measured", "H6", passed, Expect::FailUntilFixed,
+
+    // Attenuation 0 makes the model return its input immediately, so its 1440
+    // samples of algorithmic delay ((fft 960 - hop 480) + lookahead 2 * 480) do
+    // not appear here. The pipeline is accountable for the remainder, which
+    // after priming is one 480-sample hop of cushion plus the resampler's own
+    // group delay. Scale to the host rate the same way the plugin does.
+    const int modelDelay = (int) std::lround (1440.0 * kSampleRate / 48000.0);
+    const int expected = reported - modelDelay;
+    const bool passed = (measured >= 0 && std::abs (measured - expected) <= 32);
+    record ("reported latency matches measured", "H6", passed, Expect::Pass,
             "reported " + std::to_string (reported)
+              + " - model " + std::to_string (modelDelay)
+              + " = expected pipeline " + std::to_string (expected)
               + ", measured " + std::to_string (measured)
-              + ", error " + (measured >= 0 ? std::to_string (measured - reported) : std::string ("n/a"))
-              + " samples (at attenuation 0, so this excludes model-dependent delay)");
+              + ", error " + (measured >= 0 ? std::to_string (measured - expected) : std::string ("n/a")));
 }
 
 //==============================================================================

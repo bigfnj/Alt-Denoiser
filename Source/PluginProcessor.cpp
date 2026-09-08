@@ -36,6 +36,27 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     tempInputFrame.resize(480, 0.0f);
     tempOutputFrame.resize(480, 0.0f);
 
+    // H5/H6: prime the output FIFO with one model hop of silence.
+    //
+    // The drain loop reads whatever the FIFO holds and zero-fills the deficit.
+    // With no priming the cushion accumulated by accident, so startup underran
+    // and spliced digital silence into the signal (measured: 448 samples at
+    // 48 kHz / 512, in runs of 32), and the resulting delay then depended on
+    // block geometry (4 samples at a 480-multiple, 451 at 512) while the
+    // reported latency stayed a constant.
+    //
+    // Input and output rates are equal and the model is 1:1, so the only
+    // mismatch is quantisation to 480-sample hops. One hop of cushion therefore
+    // bounds the worst-case deficit, and the FIFO can no longer underrun.
+    //
+    // This is also what the existing 1920 figure already assumed: 1440 samples
+    // of model algorithmic delay ((960-480) + 2*480) plus 480 of cushion. The
+    // number was right; the priming that would have made it true was missing.
+    {
+        const std::vector<float> primingSilence((size_t) 480, 0.0f);
+        outputFifo.push(primingSilence.data(), 480);
+    }
+
     int latencyInHost = juce::roundToInt(1920.0 * (sampleRate / 48000.0));
     setLatencySamples(latencyInHost);
 
