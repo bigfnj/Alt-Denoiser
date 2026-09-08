@@ -36,6 +36,27 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     tempInputFrame.resize(480, 0.0f);
     tempOutputFrame.resize(480, 0.0f);
 
+    // H5/H6: prime the output FIFO with one model hop of silence.
+    //
+    // The drain loop reads whatever the FIFO holds and zero-fills the deficit.
+    // With no priming the cushion accumulated by accident, so startup underran
+    // and spliced digital silence into the signal (measured: 448 samples at
+    // 48 kHz / 512, in runs of 32), and the resulting delay then depended on
+    // block geometry (4 samples at a 480-multiple, 451 at 512) while the
+    // reported latency stayed a constant.
+    //
+    // Input and output rates are equal and the model is 1:1, so the only
+    // mismatch is quantisation to 480-sample hops. One hop of cushion therefore
+    // bounds the worst-case deficit, and the FIFO can no longer underrun.
+    //
+    // This is also what the existing 1920 figure already assumed: 1440 samples
+    // of model algorithmic delay ((960-480) + 2*480) plus 480 of cushion. The
+    // number was right; the priming that would have made it true was missing.
+    {
+        const std::vector<float> primingSilence((size_t) 480, 0.0f);
+        outputFifo.push(primingSilence.data(), 480);
+    }
+
     int latencyInHost = juce::roundToInt(1920.0 * (sampleRate / 48000.0));
     setLatencySamples(latencyInHost);
 
@@ -45,12 +66,42 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         modelLoaded = false;
     }
 
+    // H2: initialize() builds a fresh DFState at a hardcoded 100 dB, but
+    // lastAttenLim kept its old value, so the change-detector in processBlock
+    // saw no delta and never re-applied the user's setting. Measured effect: a
+    // knob left at 0 dB rendered a tone 45 dB quieter after a re-prepare, so
+    // the plugin silently applied maximum reduction while the UI read zero.
+    // Resetting the sentinel forces the next block to push the real value.
+    lastAttenLim = -1.0f;
+
+    // C5: remember what we sized the resample buffers for, so processBlock can
+    // refuse a block larger than we allocated instead of writing past the end.
+    preparedBlockSize = samplesPerBlock;
+
     // init resampler
     resamplerHandler = std::make_unique<Resampler<1, 1>>(sampleRate, 48000.0);
     double maxRatio = 48000.0 / sampleRate;
     int maxResampledSize = (int)(samplesPerBlock * maxRatio) + 128; // +128 for safety margin
     resampleInBuffer.resize(maxResampledSize);
     resampleOutBuffer.resize(maxResampledSize);
+    monoBuffer.assign((size_t) samplesPerBlock, 0.0f);
+}
+
+bool AltDenoiserProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
+{
+    const auto& in  = layouts.getMainInputChannelSet();
+    const auto& out = layouts.getMainOutputChannelSet();
+
+    if (in.isDisabled() || out.isDisabled())
+        return false;
+
+    // The processing chain is mono in the middle and fans back out, so anything
+    // beyond mono or stereo would leave the extra channels unprocessed.
+    if (in != out)
+        return false;
+
+    return in == juce::AudioChannelSet::mono()
+        || in == juce::AudioChannelSet::stereo();
 }
 
 void AltDenoiserProcessor::releaseResources() {
@@ -61,10 +112,24 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     auto totalNumInputChannels  = getTotalNumInputChannels();
     auto totalNumOutputChannels = getTotalNumOutputChannels();
 
-    // safety check
-    if (!modelLoaded || dfProcessor == nullptr || !dfProcessor->isReady()) {
-        buffer.clear(); 
-        return; 
+    // H7: when the model is unavailable, pass audio through unchanged rather
+    // than calling buffer.clear(). Muting the track reads as a broken DAW and
+    // gives the user nothing to diagnose; a denoiser that cannot load should
+    // simply not denoise. The meters are still updated below so the UI shows
+    // signal arriving and leaving, instead of freezing at their last values and
+    // making a silent plugin look healthy.
+    const bool modelAvailable = modelLoaded && dfProcessor != nullptr && dfProcessor->isReady();
+
+    // C5: the resample buffers were sized from the samplesPerBlock the host
+    // declared in prepareToPlay. A host that then delivers a larger block would
+    // make the resampler write past the end of those vectors: preparing for 128
+    // at 44.1 kHz allocates 267 floats, and a 512-sample block writes 292 floats
+    // (1168 bytes) beyond it. VST3 treats maxSamplesPerBlock as binding, but
+    // nothing here should depend on the host honouring it. Pass the audio
+    // through untouched rather than corrupting the heap.
+    if (buffer.getNumSamples() > preparedBlockSize) {
+        jassertfalse;
+        return;
     }
  
     // input rms
@@ -78,16 +143,37 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // clear and parameter update
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
         buffer.clear(i, 0, buffer.getNumSamples());
+
+  if (modelAvailable) {
     float newAttenLim = *apvts.getRawParameterValue("atten_lim");
     if (std::abs(newAttenLim - lastAttenLim) > 0.01f) {
         dfProcessor->setAttenLim(newAttenLim);
         lastAttenLim = newAttenLim;
     }
 
-    // resample
-    float* sourceInputPtrs[] = { buffer.getWritePointer(0) }; float* sourceOutputPtrs[] = { buffer.getWritePointer(0) }; 
-    float* targetInputPtrs[] = { resampleInBuffer.data() };   float* targetOutputPtrs[] = { resampleOutBuffer.data() };
     int hostNumSamples = buffer.getNumSamples();
+
+    // H4: the model has one channel. The old code read only channel 0 and later
+    // overwrote channel 1 with a copy, so anything present only in the right
+    // input was discarded before inference: hard-panned content vanished and an
+    // M/S or dual-mic recording lost half its information. Sum to mono first so
+    // every input channel reaches the model. The wet result is still mono and is
+    // fanned back out below, which is inherent to a one-channel model.
+    {
+        auto* mono = monoBuffer.data();
+        if (totalNumInputChannels >= 2) {
+            const auto* left  = buffer.getReadPointer(0);
+            const auto* right = buffer.getReadPointer(1);
+            for (int i = 0; i < hostNumSamples; ++i)
+                mono[i] = 0.5f * (left[i] + right[i]);
+        } else {
+            juce::FloatVectorOperations::copy(mono, buffer.getReadPointer(0), hostNumSamples);
+        }
+    }
+
+    // resample
+    float* sourceInputPtrs[] = { monoBuffer.data() }; float* sourceOutputPtrs[] = { monoBuffer.data() };
+    float* targetInputPtrs[] = { resampleInBuffer.data() };   float* targetOutputPtrs[] = { resampleOutBuffer.data() };
     resamplerHandler->process(
         sourceInputPtrs,
         sourceOutputPtrs,
@@ -121,9 +207,10 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         }
     );
 
-    if (totalNumOutputChannels > 1) {
-        buffer.copyFrom(1, 0, buffer, 0, 0, hostNumSamples);
-    }
+    // Fan the mono wet result back out to every output channel.
+    for (int ch = 0; ch < totalNumOutputChannels; ++ch)
+        juce::FloatVectorOperations::copy(buffer.getWritePointer(ch), monoBuffer.data(), hostNumSamples);
+  }   // if (modelAvailable); otherwise the buffer passes through untouched
 
     // output RMS
     float currentOutRMS = 0.0f;
