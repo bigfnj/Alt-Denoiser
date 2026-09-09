@@ -2,6 +2,11 @@ name: Build and Release
 
 on:
   push:
+    # Tags cut a release. Branch pushes only build and test; the release job
+    # below is still gated on refs/tags. Without the branch trigger nothing ran
+    # on a normal push, so CI never fired during day-to-day development.
+    branches:
+      - main
     tags:
       - 'v*.*.*'
   pull_request:
