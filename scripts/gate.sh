@@ -99,12 +99,22 @@ fi
 
 #------------------------------------------------------------------------------
 say "4. Packaging shape"
-COUNT=$(find "$BUILD_DIR" -type d -name '*.vst3' -prune -print | wc -l | tr -d ' ')
-if [ "$COUNT" = "1" ]; then
-    ok "exactly one .vst3 bundle"
-else
-    fail "expected exactly one .vst3 bundle, found $COUNT"
-fi
+# Checks every format this platform is expected to build, not just the VST3.
+# Checking one format would silently under-verify macOS and Linux, where the
+# workflow now stages two and a missing AU or LV2 would reach a release.
+case "${RUNNER_OS:-$(uname -s)}" in
+    Darwin|macOS) FORMATS="vst3 component" ;;
+    Linux)        FORMATS="vst3 lv2" ;;
+    *)            FORMATS="vst3" ;;
+esac
+for ext in $FORMATS; do
+    COUNT=$(find "$BUILD_DIR" -type d -name "*.${ext}" -prune -print | wc -l | tr -d ' ')
+    if [ "$COUNT" = "1" ]; then
+        ok "exactly one .${ext} bundle"
+    else
+        fail "expected exactly one .${ext} bundle, found $COUNT"
+    fi
+done
 if [ -f LICENSE ]; then
     ok "LICENSE present for packaging"
 else
