@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "DeepFilterNetProcessor.h"
+#include "InferenceWorker.h"
 #include "Resampler.hpp"
 #include <algorithm>
 #include <atomic>
@@ -116,6 +117,9 @@ public:
 private:
     std::unique_ptr<DeepFilterNetProcessor> dfProcessor;
 
+    // M1: owns the model and runs inference off the audio callback.
+    InferenceWorker worker;
+
     SimpleFifo inputFifo;
     SimpleFifo outputFifo;
     std::vector<float> tempInputFrame;
@@ -133,6 +137,30 @@ private:
     std::vector<float> resampleOutBuffer;
     std::vector<float> monoBuffer;   // H4: host-rate mono sum fed to the model
     int modelFrameLength = 480;      // M3: hop size reported by the loaded model
+
+    // M1: latency-aligned dry signal, used when the worker has not produced a
+    // hop in time. Emitting the delayed dry input is a dropout the listener may
+    // not notice; emitting digital silence is a click they always will.
+    SimpleFifo dryDelay;
+    std::vector<float> dryScratch;
+
+    // M1: monotonic hop counter, and the barrier below which collected output is
+    // discarded. Both are touched only by the audio thread and reset().
+    unsigned nextInputSequence = 0;
+    unsigned acceptFromSequence = 0;
+
+public:
+    /** Diagnostics for the M1 worker path. Read from any thread.
+
+        fallbackSamples counts output samples the worker failed to deliver in
+        time, which were filled from the latency-aligned dry signal. In steady
+        state this should stop increasing entirely: one hop of cushion is 10 ms
+        at 48 kHz against a measured 0.32 ms of inference per hop.
+    */
+    std::atomic<unsigned> fallbackSamples { 0 };
+    int getWorkerDroppedFrames() const { return worker.getDroppedFrames(); }
+
+private:
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AltDenoiserProcessor)

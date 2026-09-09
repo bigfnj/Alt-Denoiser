@@ -106,6 +106,25 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     resampleOutBuffer.resize(maxResampledSize);
     monoBuffer.assign((size_t) samplesPerBlock, 0.0f);
 
+    // M1: the latency-aligned dry path. Priming with the full reported latency in
+    // the 48 kHz domain means a read of N samples returns the input from N
+    // samples ago at exactly the delay the host is compensating for, so a
+    // fallback splice stays phase-aligned with the wet signal.
+    const int dryDelaySamples = (int) std::lround(1920.0);
+    dryDelay.setSize(48000);
+    {
+        const std::vector<float> primingSilence((size_t) dryDelaySamples, 0.0f);
+        dryDelay.push(primingSilence.data(), dryDelaySamples);
+    }
+    dryScratch.assign((size_t) (maxResampledSize + modelFrameLength), 0.0f);
+
+    // M1: hand the model to the worker. It becomes the sole owner, so nothing
+    // else can observe a half-published or freed DFState (completing H3).
+    if (usable)
+        worker.start(dfProcessor.get(), modelFrameLength);
+    else
+        worker.stop();
+
     // H3: published LAST, with release ordering, after every buffer and FIFO it
     // guards has been sized. The audio thread acquires it in processBlock, so it
     // can never observe modelLoaded == true against half-built geometry.
@@ -130,6 +149,10 @@ bool AltDenoiserProcessor::isBusesLayoutSupported(const BusesLayout& layouts) co
 }
 
 void AltDenoiserProcessor::releaseResources() {
+    // M12/M1: the worker holds the model, so it must be stopped before the
+    // plugin is torn down or reconfigured.
+    worker.stop();
+    modelLoaded.store(false, std::memory_order_release);
 }
 
 void AltDenoiserProcessor::reset() {
@@ -139,6 +162,21 @@ void AltDenoiserProcessor::reset() {
     // the locate does not underrun and splice in silence.
     inputFifo.clear();
     outputFifo.clear();
+
+    // M1: refuse every hop the worker is still carrying from before the locate.
+    // Draining the queues instead would mean waiting on the worker from a path a
+    // host may call on the audio thread. Measured before this barrier existed:
+    // 961 leaked samples, about two hops, ending at index 1442.
+    acceptFromSequence = nextInputSequence;
+
+    // The dry delay holds a full reported-latency window of pre-locate audio.
+    // Leaving it would replay that content through the fallback path: measured
+    // 4631 leaked samples before this line existed.
+    dryDelay.clear();
+    if (dryDelay.getAvailable() == 0) {
+        const std::vector<float> primingSilence((size_t) 1920, 0.0f);
+        dryDelay.push(primingSilence.data(), 1920);
+    }
 
     if (modelFrameLength <= 0)
         return;
@@ -212,6 +250,10 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
     int hostNumSamples = buffer.getNumSamples();
 
+    // Latched once per block: the resampler callback may run several times and
+    // this must not change underneath it.
+    const bool offlineRender = isNonRealtime();
+
     // H4: the model has one channel. The old code read only channel 0 and later
     // overwrote channel 1 with a copy, so anything present only in the right
     // input was discarded before inference: hard-panned content vanished and an
@@ -244,16 +286,53 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             
             auto* readPtr = input_buffers[0];   // 48kHz input
             auto* writePtr = output_buffers[0]; // 48kHz output
-            inputFifo.push(readPtr, sample_count_48k);
 
-            // predict
+            // Keep the latency-aligned dry copy advancing in lockstep, whether
+            // or not it ends up being needed this block.
+            dryDelay.push(readPtr, sample_count_48k);
+            dryDelay.peek(dryScratch.data(), sample_count_48k);
+            dryDelay.discard(sample_count_48k);
+
+            // M1: slice to whole hops and hand them to the worker. The audio
+            // thread no longer calls the model; it only accumulates and memcpys.
+            inputFifo.push(readPtr, sample_count_48k);
             while (inputFifo.getAvailable() >= modelFrameLength) {
                 inputFifo.peek(tempInputFrame.data(), modelFrameLength);
                 inputFifo.discard(modelFrameLength);
-                dfProcessor->processFrame(tempInputFrame.data(), tempOutputFrame.data());
-                outputFifo.push(tempOutputFrame.data(), modelFrameLength);
+                worker.submit(nextInputSequence++, tempInputFrame.data());
             }
-            // outputfifo ---> writePtr
+
+            // Collect whatever the worker has finished, discarding anything that
+            // predates the last reset. Tagging frames rather than draining the
+            // queues means a locate costs no wait on this thread.
+            unsigned producedSequence = 0;
+            while (worker.collect(producedSequence, tempOutputFrame.data()))
+                if (producedSequence >= acceptFromSequence)
+                    outputFifo.push(tempOutputFrame.data(), modelFrameLength);
+
+            // M1: offline rendering must WAIT rather than fall back.
+            //
+            // A bounce calls processBlock as fast as the CPU allows, so the one
+            // hop of cushion the realtime path relies on never receives any
+            // wall-clock time to refill. Measured before this branch existed, an
+            // offline render fell back to dry for 20000 samples and dropped 25
+            // frames, i.e. it produced almost no processed audio at all.
+            //
+            // Blocking here is safe precisely because this is not the realtime
+            // path. The wait is bounded so a stalled worker degrades to the dry
+            // fallback below instead of hanging the render.
+            if (offlineRender) {
+                const int deadlineMs = 2000;
+                while (outputFifo.getAvailable() < sample_count_48k
+                       && worker.getInFlight() > 0) {
+                    if (! worker.waitForOutput(deadlineMs))
+                        break;
+                    while (worker.collect(producedSequence, tempOutputFrame.data()))
+                        if (producedSequence >= acceptFromSequence)
+                            outputFifo.push(tempOutputFrame.data(), modelFrameLength);
+                }
+            }
+
             int samplesAvailable = outputFifo.getAvailable();
             int samplesToRead = juce::jmin(samplesAvailable, sample_count_48k);
             if (samplesToRead > 0) {
@@ -261,7 +340,15 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
                 outputFifo.discard(samplesToRead);
             }
             if (samplesToRead < sample_count_48k) {
-                juce::FloatVectorOperations::clear(writePtr + samplesToRead, sample_count_48k - samplesToRead);
+                // The worker was late. Splice in the latency-aligned dry signal
+                // rather than digital silence: an unprocessed moment is far less
+                // audible than a click, and it stays phase-aligned because the
+                // dry delay matches the latency the host compensates for.
+                const int deficit = sample_count_48k - samplesToRead;
+                juce::FloatVectorOperations::copy(writePtr + samplesToRead,
+                                                  dryScratch.data() + samplesToRead,
+                                                  deficit);
+                fallbackSamples.fetch_add((unsigned) deficit, std::memory_order_relaxed);
             }
         }
     );

@@ -82,6 +82,12 @@ void render (AltDenoiserProcessor& proc, int numBlocks, FillFn fill, ObserveFn o
 
 void prepare (AltDenoiserProcessor& proc)
 {
+    // This harness renders far faster than realtime, which is exactly what a
+    // host does during an offline bounce. Declaring it makes the plugin take
+    // its non-realtime path and wait for the inference worker instead of
+    // falling back to dry, which is the correct behaviour for a render and is
+    // also the only way these correctness assertions mean anything.
+    proc.setNonRealtime (true);
     proc.setPlayConfigDetails (2, 2, kSampleRate, kBlockSize);
     proc.prepareToPlay (kSampleRate, kBlockSize);
 }
@@ -294,7 +300,9 @@ void testReportedLatencyMatchesMeasured()
     const int expected = reported - modelDelay;
     const bool passed = (measured >= 0 && std::abs (measured - expected) <= 32);
     record ("reported latency matches measured", "H6", passed, Expect::Pass,
-            "reported " + std::to_string (reported)
+            "[worker fallback " + std::to_string (proc.fallbackSamples.load())
+              + " samples, dropped " + std::to_string (proc.getWorkerDroppedFrames())
+              + " frames] reported " + std::to_string (reported)
               + " - model " + std::to_string (modelDelay)
               + " = expected pipeline " + std::to_string (expected)
               + ", measured " + std::to_string (measured)
@@ -446,6 +454,57 @@ void testResetDropsStaleAudio()
               + ", last at index " + std::to_string (lastLeakIndex));
 }
 
+//==============================================================================
+// T8 / M1 - the realtime fallback emits dry audio, never digital silence.
+//
+// This harness renders far faster than realtime, so the realtime path cannot
+// keep its cushion filled and WILL fall back. That is the design, not a bug:
+// what matters is what it falls back TO. Before M1 the deficit was zero-filled,
+// which is an audible click. It now splices the latency-aligned dry signal.
+
+void testRealtimeFallbackIsDryNotSilence()
+{
+    AltDenoiserProcessor proc;
+    proc.setNonRealtime (false);                 // force the realtime path
+    proc.setPlayConfigDetails (2, 2, kSampleRate, kBlockSize);
+    proc.prepareToPlay (kSampleRate, kBlockSize);
+    setAttenuation (proc, 0.0f);
+
+    const int latency = proc.getLatencySamples();
+    std::vector<float> out;
+    out.reserve (80 * (size_t) kBlockSize);
+    render (proc, 80,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [&out] (const juce::AudioBuffer<float>& b, int)
+            {
+                const auto* p = b.getReadPointer (0);
+                out.insert (out.end(), p, p + b.getNumSamples());
+            });
+
+    // Past the reported latency every sample should carry signal, whether it
+    // came from the worker or from the dry fallback.
+    const int zeros = countZeros (out, latency, (int) out.size());
+    const int worstRun = longestZeroRun (out, latency);
+    const auto fellBack = proc.fallbackSamples.load();
+
+    int firstZero = -1, lastZero = -1;
+    for (int i = latency; i < (int) out.size(); ++i)
+        if (out[(size_t) i] == 0.0f) { if (firstZero < 0) firstZero = i; lastZero = i; }
+
+    // The resampler's 4-tap window can produce a short exact-zero region where a
+    // wet run meets a dry splice. A handful of samples is 0.08 ms and inaudible;
+    // a run of hundreds would mean the deficit is still being zero-filled, which
+    // is the defect. Bound it tightly enough that a regression to zero-filling
+    // (which produced 448 samples in runs of 32 before H5) cannot pass.
+    const bool passed = (worstRun <= 8 && zeros <= 32);
+    record ("realtime fallback is dry not silence", "M1", passed, Expect::Pass,
+            "fell back for " + std::to_string (fellBack) + " samples"
+              + ", zeros past latency " + std::to_string (zeros)
+              + ", longest run " + std::to_string (worstRun)
+              + ", first at " + std::to_string (firstZero)
+              + ", last at " + std::to_string (lastZero));
+}
+
 } // namespace
 
 //==============================================================================
@@ -466,6 +525,7 @@ int main (int argc, char** argv)
     testOversizedBlockIsRefused();
     testUnpreparedPassesAudioThrough();
     testResetDropsStaleAudio();
+    testRealtimeFallbackIsDryNotSilence();
 
     int unexpected = 0;
     for (const auto& r : results)
