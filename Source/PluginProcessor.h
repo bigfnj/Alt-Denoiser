@@ -153,9 +153,17 @@ public:
     bool producesMidi() const override { return false; }
     // M5: was 0.0, which tells the host it may stop calling processBlock the
     // moment input ends, truncating the tail of an offline bounce. The pipeline
-    // holds the reported latency (1920 samples at 48 kHz, and it scales with the
-    // rate, so 40 ms at any rate) before anything reaches the output.
-    double getTailLengthSeconds() const override { return 1920.0 / 48000.0; }
+    // holds the whole reported latency before anything reaches the output.
+    //
+    // 7a: set by prepareToPlay from the DERIVED latency and the actual rate, so
+    // it cannot disagree with getLatencySamples(). It used to be a second
+    // hardcoded 1920/48000, which meant the failed-load path reported zero
+    // latency and a 40 ms tail simultaneously. Zero before the first prepare is
+    // correct: nothing is loaded, so nothing is held.
+    double getTailLengthSeconds() const override
+    {
+        return tailLengthSeconds.load (std::memory_order_relaxed);
+    }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -299,6 +307,12 @@ private:
     SimpleFifo dryDelay;
     std::vector<float> dryScratch;
     int primedDryDelay = 0;   // what prepareToPlay primed, so reset() matches it
+
+    // 7a: reported latency in the 48 kHz domain, derived from the loaded model's
+    // geometry. The single source for setLatencySamples, the dry delay priming
+    // and the tail length.
+    int derivedLatency48k = 0;
+    std::atomic<double> tailLengthSeconds { 0.0 };
 
     // M7: the bypass path needs the ORIGINAL input, per channel, at HOST rate,
     // delayed by exactly the reported latency. dryDelay cannot serve: it is mono

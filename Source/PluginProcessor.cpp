@@ -80,7 +80,9 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     if (! (sampleRate >= 8000.0 && sampleRate <= 384000.0) || samplesPerBlock <= 0) {
         jassertfalse;
         preparedBlockSize = 0;
+        derivedLatency48k = 0;
         setLatencySamples(0);
+        tailLengthSeconds.store(0.0, std::memory_order_relaxed);
         modelLoaded.store(false, std::memory_order_release);
         return;
     }
@@ -125,13 +127,34 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // number was right; the priming that would have made it true was missing.
     outputFifo.pushSilence(modelFrameLength);
 
+    // 7a: DERIVED from the loaded model, not hardcoded.
+    //
+    //   model delay = (fft_size - hop_size) + lookahead * hop_size
+    //   reported    = model delay + one hop of quantisation cushion
+    //
+    // For the standard archive that is (960-480) + 2*480 + 480 = 1920, which is
+    // exactly the literal this replaces. The literal was never wrong; it was
+    // unmaintainable. The low-latency archive has lookahead 0 and therefore a
+    // true latency of 960, so shipping it against a hardcoded 1920 would
+    // over-report by 20 ms and a compensating host would play the track early:
+    // the same defect class as H6, which is what motivated deriving it.
+    //
+    // libDF's C API could not supply fft_size or lookahead. alt_df_info can,
+    // which is why this had to wait for the shim.
+    derivedLatency48k = usable
+        ? dfProcessor->getModelDelaySamples() + modelFrameLength
+        : 0;
+
     // Report zero latency when the model could not be loaded. The bypass path
     // (H7) passes audio through untouched, so asking the host to delay every
     // other track by 40 ms for a plugin that is not processing is simply wrong.
-    const int latencyInHost = usable
-        ? juce::roundToInt(1920.0 * (sampleRate / 48000.0))
-        : 0;
+    const int latencyInHost = juce::roundToInt(derivedLatency48k * (sampleRate / 48000.0));
     setLatencySamples(latencyInHost);
+
+    // M5: the tail must agree with the latency. It used to be a second hardcoded
+    // 1920/48000, so on the failed-load path the plugin reported zero latency
+    // and a 40 ms tail at the same time.
+    tailLengthSeconds.store(latencyInHost / sampleRate, std::memory_order_relaxed);
 
     // L6/H2: adopt the parameter's CURRENT value with no ramp. This is the
     // priming case, and here it is one call rather than the flag-and-race the
@@ -176,7 +199,9 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // the 48 kHz domain means a read of N samples returns the input from N
     // samples ago at exactly the delay the host is compensating for, so a
     // fallback splice stays phase-aligned with the wet signal.
-    const int dryDelaySamples = (int) std::lround(1920.0);
+    // 48 kHz domain, so this is the derived figure directly rather than the
+    // host-rate one.
+    const int dryDelaySamples = derivedLatency48k;
     dryDelay.setSize(48000);
     dryDelay.pushSilence(dryDelaySamples);
     primedDryDelay = dryDelaySamples;   // so reset() re-primes the same amount

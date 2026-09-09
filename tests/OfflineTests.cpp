@@ -1130,6 +1130,201 @@ void testCorruptModelDegradesToBypass()
     record ("corrupt model degrades to bypass", "C1/C2", failures.empty(), Expect::Pass, detail);
 }
 
+void testLatencyIsDerivedFromTheModel()
+{
+    // 7a. The reported latency used to be a 1920 literal in three places plus a
+    // fourth copy inside getTailLengthSeconds. Correct for the standard archive,
+    // and 960 too high for the low-latency one. This asserts prepareToPlay
+    // actually USES the model's geometry rather than computing it and then
+    // reporting a constant anyway.
+
+    DeepFilterNetProcessor probe;
+    const bool probeLoaded = probe.initialize();
+    const int expected48k = probe.getModelDelaySamples() + (int) probe.getFrameLength();
+    const int expectedHost = juce::roundToInt (expected48k * (kSampleRate / 48000.0));
+
+    AltDenoiserProcessor proc;
+    prepare (proc);
+    const int reported = proc.getLatencySamples();
+    const double tail  = proc.getTailLengthSeconds();
+
+    // The tail must be the same quantity in seconds, or an offline bounce is
+    // truncated by exactly the disagreement.
+    const double tailSamples = tail * kSampleRate;
+    const bool tailAgrees = std::abs (tailSamples - (double) reported) < 1.0;
+
+    // A refused prepare must zero BOTH. Reporting a 40 ms tail while reporting
+    // zero latency is what the hardcoded version did.
+    AltDenoiserProcessor refused;
+    refused.setNonRealtime (true);
+    refused.setPlayConfigDetails (2, 2, 48000.0, 512);
+    refused.prepareToPlay (0.0, 0);
+    const bool refusedIsZero = (refused.getLatencySamples() == 0)
+                            && (refused.getTailLengthSeconds() == 0.0);
+
+    const bool passed = probeLoaded && (reported == expectedHost)
+                     && tailAgrees && refusedIsZero;
+
+    record ("latency is derived from the model", "7a", passed, Expect::Pass,
+            "model delay " + std::to_string (probe.getModelDelaySamples())
+              + " + hop " + std::to_string ((int) probe.getFrameLength())
+              + " = " + std::to_string (expected48k) + " at 48k -> "
+              + std::to_string (expectedHost) + " at " + std::to_string ((int) kSampleRate)
+              + "; reported " + std::to_string (reported)
+              + ", tail " + std::to_string (tailSamples) + " samples"
+              + ", refused prepare reports "
+              + std::to_string (refused.getLatencySamples()) + "/"
+              + std::to_string (refused.getTailLengthSeconds()));
+}
+
+void testDryAndWetArriveTogether()
+{
+    // 7a, and the gap mutation testing exposed.
+    //
+    // H6 measures the plugin at attenuation 0, which is fully DRY, and the dry
+    // path is delayed by exactly the derived figure. H6 and the derivation
+    // therefore move together: mis-derive the model delay and H6 still passes,
+    // because it is comparing the derivation against itself. This measures the
+    // WET path, whose delay is the model's own and which prepareToPlay cannot
+    // shift, so it checks the derivation against physics.
+    //
+    // By ENVELOPE cross-correlation. Two cheaper methods do not work here and
+    // the numbers are recorded so nobody retries them:
+    //
+    //   First-audible. The 960-sample analysis window smears a burst onset up to
+    //   959 samples EARLY, so the wet path reports 999 for a true group delay of
+    //   1920. Not comparable with the dry path's 1923.
+    //
+    //   Energy centroid. The model emits a low-level floor throughout the silent
+    //   regions, and it attenuates a synthetic tone hard, so the floor outweighs
+    //   the burst: the wet centroid lands at -438, i.e. before the input.
+    //
+    // A decimated peak envelope, mean-removed, correlates on the burst's shape
+    // rather than its absolute level, so neither of those matters.
+
+    // The stimulus is defined in SAMPLES, not in blocks, so it is byte-identical
+    // at every block size the gate runs. A block-defined burst made the measured
+    // wet lag move 384 samples between 512 and 1024, because a longer plateau
+    // flattens the correlation peak and the argmax wanders across it. A short
+    // burst gives a sharp, unique peak.
+    const int burstStart  = 10240;
+    const int burstLength = 4800;
+    const int totalSamples = 60000;
+
+    auto renderBurst = [burstStart, burstLength, totalSamples]
+                       (float attenDb, std::vector<float>& in, std::vector<float>& out)
+    {
+        AltDenoiserProcessor proc;
+        prepare (proc);
+        setAttenuation (proc, attenDb);
+
+        const int numBlocks = (totalSamples + kBlockSize - 1) / kBlockSize;
+        in.clear();
+        out.clear();
+        render (proc, numBlocks,
+                [burstStart, burstLength, &in] (juce::AudioBuffer<float>& b, int blk)
+                {
+                    const int base = blk * kBlockSize;
+                    for (int i = 0; i < b.getNumSamples(); ++i)
+                    {
+                        const int n = base + i;
+                        if (n < burstStart || n >= burstStart + burstLength) continue;
+                        const auto t = (double) n / kSampleRate;
+                        const auto v = (float) (0.25 * std::sin (juce::MathConstants<double>::twoPi * 440.0 * t)
+                                              + 0.25 * std::sin (juce::MathConstants<double>::twoPi * 880.0 * t));
+                        b.setSample (0, i, v);
+                        b.setSample (1, i, v);
+                    }
+                    const auto* p = b.getReadPointer (0);
+                    in.insert (in.end(), p, p + b.getNumSamples());
+                },
+                [&out] (const juce::AudioBuffer<float>& b, int)
+                {
+                    const auto* p = b.getReadPointer (0);
+                    out.insert (out.end(), p, p + b.getNumSamples());
+                });
+        return proc.getLatencySamples();
+    };
+
+    // Decimation scales with the host rate so the envelope is analysed at the
+    // same resolution in the MODEL's 48 kHz domain at every geometry. Fixed at
+    // 64 host samples, the wet lag measured 128 samples early at 48 kHz but 768
+    // early at 96 kHz: finer relative resolution resolves more of the model's
+    // soft leading ramp and pulls the correlation peak earlier.
+    const int decim = juce::jmax (8, juce::roundToInt (64.0 * (kSampleRate / 48000.0)));
+    auto envelope = [decim] (const std::vector<float>& x)
+    {
+        std::vector<double> e;
+        e.reserve (x.size() / (size_t) decim);
+        for (size_t i = 0; i + (size_t) decim <= x.size(); i += (size_t) decim)
+        {
+            double m = 0.0;
+            for (int j = 0; j < decim; ++j)
+                m = std::max (m, (double) std::abs (x[i + (size_t) j]));
+            e.push_back (m);
+        }
+        double mean = 0.0;
+        for (double v : e) mean += v;
+        mean /= (double) std::max<size_t> (1, e.size());
+        for (double& v : e) v -= mean;
+        return e;
+    };
+
+    // Best lag, in samples, that aligns the output envelope to the input one.
+    auto bestLag = [&envelope, decim] (const std::vector<float>& in,
+                                       const std::vector<float>& out) -> int
+    {
+        const auto a = envelope (in);
+        const auto b = envelope (out);
+        const int maxLagBins = (int) (8000 / decim);
+
+        double best = -1.0e30;
+        int bestBin = -1;
+        for (int lag = 0; lag <= maxLagBins; ++lag)
+        {
+            double num = 0.0, da = 0.0, db = 0.0;
+            for (size_t i = 0; i + (size_t) lag < b.size() && i < a.size(); ++i)
+            {
+                num += a[i] * b[i + (size_t) lag];
+                da  += a[i] * a[i];
+                db  += b[i + (size_t) lag] * b[i + (size_t) lag];
+            }
+            const double denom = std::sqrt (da * db);
+            const double r = denom > 1.0e-12 ? num / denom : 0.0;
+            if (r > best) { best = r; bestBin = lag; }
+        }
+        return bestBin * decim;
+    };
+
+    std::vector<float> dryIn, dryOut, wetIn, wetOut;
+    const int reported = renderBurst (0.0f, dryIn, dryOut);      // 0 dB   = fully dry
+    renderBurst (100.0f, wetIn, wetOut);                          // 100 dB = fully wet
+
+    const int dryLag = bestLag (dryIn, dryOut);
+    const int wetLag = bestLag (wetIn, wetOut);
+
+    // Six bins. One for the decimation itself, the rest for the model's edge
+    // shaping, which biases the wet peak two bins early at 48 kHz and four at
+    // 96 kHz, where the 2:1 resampling adds its own smearing. Measured actuals
+    // are 128 samples at 48 kHz and 512 at 96 kHz; four bins put 96 kHz exactly
+    // on the boundary, which is not a margin.
+    //
+    // This is still far tighter than the error it guards against: dropping the
+    // lookahead term moves the wet lag 832 samples at 48 kHz and 1408 at 96 kHz,
+    // against tolerances of 384 and 768.
+    const int tolerance = 6 * decim;
+    const bool dryOk = std::abs (dryLag - reported) <= tolerance;
+    const bool wetOk = std::abs (wetLag - reported) <= tolerance;
+
+    const bool passed = dryOk && wetOk;
+    record ("dry and wet paths arrive together", "7a", passed, Expect::Pass,
+            "reported " + std::to_string (reported)
+              + ", dry envelope lag " + std::to_string (dryLag)
+              + ", wet envelope lag " + std::to_string (wetLag)
+              + " (resolution " + std::to_string (decim)
+              + ", tolerance " + std::to_string (tolerance) + ")");
+}
+
 void testModelMetadataIsReported()
 {
     // libDF's C API exposed only the hop size, which is why the plugin's
@@ -1405,6 +1600,8 @@ int main (int argc, char** argv)
     testBypassParameterIsExposedAndSaved();
     testCorruptModelDegradesToBypass();
     testModelMetadataIsReported();
+    testLatencyIsDerivedFromTheModel();
+    testDryAndWetArriveTogether();
     testWrongFrameLengthIsRefused();
 
     int unexpected = 0;
