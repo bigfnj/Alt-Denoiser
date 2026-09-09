@@ -6,6 +6,7 @@
 #include "Resampler.hpp"
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <vector>
 #include <memory>
 
@@ -192,7 +193,30 @@ private:
     // same problem and is only fully resolved by moving inference to a worker
     // that owns it exclusively (M1).
     std::atomic<bool> modelLoaded { false };
-    float lastAttenLim = -1.0f;   // sentinel: forces the first block to apply the real value
+    /** Maps the attenuation-limit parameter, in dB, to the dry proportion of the
+        output mix.
+
+        This is libDF's own formula (tract.rs): a limit of 100 dB or more means
+        "no limit", i.e. fully enhanced; below 0.01 dB means no reduction at all,
+        i.e. fully dry; in between the dry share is 10^(-db/20). Reproducing it
+        here rather than inside the model is what makes the limit smoothable per
+        sample, because the plugin already holds the aligned dry signal.
+    */
+    static float attenLimitToDryMix(float db) noexcept
+    {
+        if (! std::isfinite(db)) return 0.0f;    // treat nonsense as "no limit"
+        const float lim = std::abs(db);
+        if (lim >= 100.0f) return 0.0f;          // fully wet
+        if (lim < 0.01f)   return 1.0f;          // fully dry
+        return std::pow(10.0f, -lim / 20.0f);
+    }
+
+    /** Dry proportion, smoothed across the block. Ramp length is in SECONDS, so
+        it is identical at every sample rate and block size, unlike the
+        hop-quantised worker slew this replaced.
+    */
+    juce::SmoothedValue<float> attenMix;
+    static constexpr double kAttenRampSeconds = 0.05;
     int preparedBlockSize = 0;    // C5: what the resample buffers were sized for
 
     std::unique_ptr<Resampler<1, 1>> resamplerHandler;
@@ -224,10 +248,10 @@ public:
     std::atomic<unsigned> fallbackSamples { 0 };
     int getWorkerDroppedFrames() const { return worker.getDroppedFrames(); }
 
-    /** L6: the attenuation limit actually pushed into the model so far,
-        which trails the parameter while a change is slewing.
+    /** L6: the dry proportion currently being mixed, 0 = fully enhanced and
+        1 = fully dry. Trails the parameter only for the ramp length.
     */
-    float getAppliedAttenLim() const { return worker.getAppliedAttenLim(); }
+    float getAttenDryMix() const { return attenMix.getCurrentValue(); }
 
 private:
 

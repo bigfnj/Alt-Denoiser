@@ -124,13 +124,16 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         : 0;
     setLatencySamples(latencyInHost);
 
-    // H2: initialize() builds a fresh DFState at a hardcoded 100 dB, but
-    // lastAttenLim kept its old value, so the change-detector in processBlock
-    // saw no delta and never re-applied the user's setting. Measured effect: a
-    // knob left at 0 dB rendered a tone 45 dB quieter after a re-prepare, so
-    // the plugin silently applied maximum reduction while the UI read zero.
-    // Resetting the sentinel forces the next block to push the real value.
-    lastAttenLim = -1.0f;
+    // L6/H2: adopt the parameter's CURRENT value with no ramp. This is the
+    // priming case, and here it is one call rather than the flag-and-race the
+    // first L6 attempt needed: setCurrentAndTargetValue cannot be defeated by
+    // thread ordering because no other thread is involved.
+    //
+    // H2 was that a fresh model reverted to its hardcoded 100 dB while the UI
+    // still showed the user's setting. The model is now always at 100 and the
+    // limit lives entirely on this side, so the failure has no mechanism left.
+    attenMix.reset(sampleRate, kAttenRampSeconds);
+    attenMix.setCurrentAndTargetValue(attenLimitToDryMix(attenParam->load(std::memory_order_relaxed)));
 
     // C5: remember what we sized the resample buffers for, so processBlock can
     // refuse a block larger than we allocated instead of writing past the end.
@@ -283,17 +286,8 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
 
   if (modelAvailable) {
     // No null fallback: attenParam is set in the constructor from a parameter
-    // createParameterLayout guarantees exists, so the branch is unreachable. The
-    // fallback that was here returned 100.0f, which is the "No limit" sentinel,
-    // so a lookup failure would have silently applied MAXIMUM reduction forever
-    // while the UI showed the user's setting.
-    const float newAttenLim = attenParam->load(std::memory_order_relaxed);
-    if (std::abs(newAttenLim - lastAttenLim) > 0.01f) {
-        // H3 residue: published to the worker rather than applied here, because
-        // the worker is concurrently inside processFrame on the same DFState.
-        worker.setAttenuationLimit(newAttenLim);
-        lastAttenLim = newAttenLim;
-    }
+    // createParameterLayout guarantees exists, so the branch is unreachable.
+    attenMix.setTargetValue(attenLimitToDryMix(attenParam->load(std::memory_order_relaxed)));
 
     int hostNumSamples = buffer.getNumSamples();
 
@@ -396,6 +390,28 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
                                                   dryScratch.data() + samplesToRead,
                                                   deficit);
                 fallbackSamples.fetch_add((unsigned) deficit, std::memory_order_relaxed);
+            }
+
+            // L6: the attenuation limit, applied HERE rather than inside the model.
+            //
+            // libDF implements atten_lim as spec_enh = (1-lim)*enh + lim*noisy
+            // with lim = 10^(-db/20), before a linear WOLA synthesis, so it is
+            // exactly a wet/dry crossfade in the time domain. dryScratch already
+            // holds that same latency-aligned dry signal (built for M1's
+            // fallback), so doing the mix here is equivalent to letting the model
+            // do it, and it can be smoothed PER SAMPLE.
+            //
+            // The first attempt at L6 slewed a cross-thread parameter on the
+            // worker instead. It froze at hop-aligned block sizes, varied its
+            // rate 3.5x-100x with host buffer size, and reintroduced H2. None of
+            // those failures is expressible in this shape: there is no
+            // cross-thread value, no hop quantisation and no priming race.
+            {
+                auto* dry = dryScratch.data();
+                for (int i = 0; i < sample_count_48k; ++i) {
+                    const float mix = attenMix.getNextValue();   // 0 = wet, 1 = dry
+                    writePtr[i] += mix * (dry[i] - writePtr[i]);
+                }
             }
         }
     );

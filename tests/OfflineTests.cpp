@@ -164,7 +164,11 @@ void testStartupZeroSplice()
     // Before the fix this was geometry-dependent: clean at 480 and 960, and
     // 448 spliced samples at 512. Priming the output FIFO with one hop removes
     // the dependence, so every geometry is now expected to be clean.
-    const bool passed = (zerosAfterLatency == 0);
+    // Asserts the longest RUN, not the count. The signal past the latency is now
+    // the dry sine (attenuation 0 is fully dry since L6), which crosses zero
+    // legitimately, so isolated zeros are expected and meaningless. The defect
+    // this guards against produced runs of 32.
+    const bool passed = (worstRun <= 4);
     record ("startup zero-splice", "H5", passed, Expect::Pass,
             "reported latency " + std::to_string (latency)
               + ", zero samples after it " + std::to_string (zerosAfterLatency)
@@ -292,21 +296,24 @@ void testReportedLatencyMatchesMeasured()
 
     const int measured = firstAudible >= 0 ? firstAudible - burstStart : -1;
 
-    // Attenuation 0 makes the model return its input immediately, so its 1440
-    // samples of algorithmic delay ((fft 960 - hop 480) + lookahead 2 * 480) do
-    // not appear here. The pipeline is accountable for the remainder, which
-    // after priming is one 480-sample hop of cushion plus the resampler's own
-    // group delay. Scale to the host rate the same way the plugin does.
-    const int modelDelay = (int) std::lround (1440.0 * kSampleRate / 48000.0);
-    const int expected = reported - modelDelay;
+    // At attenuation 0 the plugin is fully dry, so the output is the INPUT
+    // delayed by the whole reported latency. That is exactly what a host
+    // compensates for, which makes this an end-to-end check of the claim rather
+    // than of one component of it.
+    //
+    // This assertion USED to subtract the model's 1440 samples, because
+    // attenuation 0 made the model return its input immediately and the output
+    // arrived at 483. That was a real defect the test was encoding: the plugin
+    // reported 1920 and delivered at 483, so a host compensating by 1920 played
+    // the track 1437 samples EARLY. Making the limit a proper crossfade (L6)
+    // fixed it, and the honest expectation is now the reported figure itself.
+    const int expected = reported;
     const bool passed = (measured >= 0 && std::abs (measured - expected) <= 32);
     record ("reported latency matches measured", "H6", passed, Expect::Pass,
             "[worker fallback " + std::to_string (proc.fallbackSamples.load())
               + " samples, dropped " + std::to_string (proc.getWorkerDroppedFrames())
               + " frames] reported " + std::to_string (reported)
-              + " - model " + std::to_string (modelDelay)
-              + " = expected pipeline " + std::to_string (expected)
-              + ", measured " + std::to_string (measured)
+              + ", measured end-to-end " + std::to_string (measured)
               + ", error " + (measured >= 0 ? std::to_string (measured - expected) : std::string ("n/a")));
 }
 
@@ -757,47 +764,116 @@ void testInvalidGeometryIsRefused()
 }
 
 //==============================================================================
-// T16 / L6 - attenuation changes are slew-limited, but a fresh model adopts the
-// real value at once.
+// T16 / L6 - the attenuation limit is a wet/dry crossfade applied per sample.
+//
+// libDF implements atten_lim as (1-lim)*enh + lim*noisy before a linear
+// synthesis, so at 0 dB ("no reduction") the output must be the INPUT delayed by
+// exactly the reported latency. That is a far stronger assertion than comparing
+// RMS levels, and it is only true if the crossfade and the dry alignment are
+// both right.
 
-void testAttenuationSlew()
+void testAttenuationIsACrossfade()
+{
+    AltDenoiserProcessor proc;
+    prepare (proc);
+    setAttenuation (proc, 0.0f);          // fully dry
+
+    const int latency = proc.getLatencySamples();
+    std::vector<float> in, out;
+    in.reserve (60 * (size_t) kBlockSize);
+    out.reserve (60 * (size_t) kBlockSize);
+    render (proc, 60,
+            [&in] (juce::AudioBuffer<float>& b, int blk)
+            {
+                fillSine (b, blk, 440.0f, 440.0f);
+                const auto* p = b.getReadPointer (0);
+                in.insert (in.end(), p, p + b.getNumSamples());
+            },
+            [&out] (const juce::AudioBuffer<float>& b, int)
+            {
+                const auto* p = b.getReadPointer (0);
+                out.insert (out.end(), p, p + b.getNumSamples());
+            });
+
+    // Compare out[latency + n] against in[n], well past the ramp and the
+    // startup region.
+    // Search a small window for the offset that best fits, rather than assuming
+    // the reported latency is exact to the sample. The resampler contributes a
+    // few samples of group delay even at a 1:1 ratio, and a fixed-offset compare
+    // turns that phase shift into a large amplitude error on a sine: 4 samples
+    // at 440 Hz is already 0.04 of full scale.
+    int bestOffset = -1;
+    double bestWorst = 1.0e9;
+    for (int off = latency - 16; off <= latency + 16; ++off)
+    {
+        if (off <= 0) continue;
+        double worst = 0.0;
+        const int from = off + 2000;
+        const int to = (int) std::min (out.size(), in.size() + (size_t) off) - 1;
+        if (to <= from) continue;
+        for (int i = from; i < to; ++i)
+            worst = std::max (worst, (double) std::abs (out[(size_t) i] - in[(size_t) (i - off)]));
+        if (worst < bestWorst) { bestWorst = worst; bestOffset = off; }
+    }
+
+    // ALIGNMENT is what L6 is about, and it is asserted tightly at every rate.
+    // The RESIDUAL is a resampler-fidelity question, not an alignment one, so its
+    // tolerance depends on the rate: at 48 kHz the converter runs 1:1 and the dry
+    // path is near-exact, while at any other rate the signal has been through
+    // 96k->48k and 48k->96k Catmull-Rom conversions before the comparison.
+    //
+    // Measured residual at 96 kHz is about 0.076 against a 0.25 peak, i.e. 30%.
+    // That is the interpolator's own error on a 440 Hz tone nowhere near Nyquist,
+    // and it is worth knowing: see the resampler quality note in BACKLOG.md.
+    const bool nativeRate = (std::abs (kSampleRate - 48000.0) < 1.0);
+    const double residualTolerance = nativeRate ? 0.01 : 0.12;
+
+    const bool primed = (std::abs (proc.getAttenDryMix() - 1.0f) < 1.0e-3f);
+    const bool aligned = (bestOffset > 0) && (std::abs (bestOffset - latency) <= 8);
+    const bool passed = primed && aligned && (bestWorst < residualTolerance);
+    record ("attenuation is a latency-aligned crossfade", "L6", passed, Expect::Pass,
+            "dry mix " + std::to_string (proc.getAttenDryMix())
+              + " (want 1.0 at 0 dB), best-fit offset " + std::to_string (bestOffset)
+              + " vs reported latency " + std::to_string (latency)
+              + ", residual " + std::to_string (bestWorst)
+              + " (tolerance " + std::to_string (residualTolerance) + ")");
+}
+
+void testAttenuationMixIsSmoothedAndBounded()
 {
     AltDenoiserProcessor proc;
     prepare (proc);
 
-    // Priming: a fresh DFState is created at a hardcoded 100 dB, so it must pick
-    // up the user's actual setting immediately rather than ramping to it. Not
-    // doing so would be H2 in a different costume: up to 1.7 s of the wrong
-    // attenuation after every prepare.
-    setAttenuation (proc, 0.0f);
-    render (proc, 8,
-            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
-            [] (const juce::AudioBuffer<float>&, int) {});
-    const float primed = proc.getAppliedAttenLim();
-
-    // A change during playback must reach the model promptly. Slewing was tried
-    // and reverted: see the revert commit.
+    // 100 dB is "no limit": fully enhanced, dry share 0.
     setAttenuation (proc, 100.0f);
-    render (proc, 8,
+    render (proc, 20,
             [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
             [] (const juce::AudioBuffer<float>&, int) {});
-    const float ramping = proc.getAppliedAttenLim();
+    const float atNoLimit = proc.getAttenDryMix();
 
-    // Given long enough it must actually arrive, not stall short.
-    render (proc, 400,
+    // A change must RAMP, not jump: one block is far shorter than the 50 ms ramp
+    // at every geometry the gate runs.
+    setAttenuation (proc, 0.0f);
+    render (proc, 1,
             [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
             [] (const juce::AudioBuffer<float>&, int) {});
-    const float arrived = proc.getAppliedAttenLim();
+    const float afterOneBlock = proc.getAttenDryMix();
 
-    const bool primedOk  = (std::abs (primed) < 0.01f);
-    const bool changedOk = (std::abs (ramping - 100.0f) < 0.01f);
-    const bool arrivedOk = (std::abs (arrived - 100.0f) < 0.01f);
+    // And it must arrive. 50 ms is at most 5 blocks at the largest geometry.
+    render (proc, 40,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [] (const juce::AudioBuffer<float>&, int) {});
+    const float settled = proc.getAttenDryMix();
 
-    const bool passed = primedOk && changedOk && arrivedOk;
-    record ("attenuation reaches the model", "L6", passed, Expect::Pass,
-            "adopted " + std::to_string (primed)
-              + " (want 0), after a 0->100 change " + std::to_string (ramping)
-              + " (want 100), still " + std::to_string (arrived) + " (want 100)");
+    const bool noLimitOk = (atNoLimit < 1.0e-3f);
+    const bool rampedOk  = (afterOneBlock > 0.0f && afterOneBlock < 0.999f);
+    const bool settledOk = (std::abs (settled - 1.0f) < 1.0e-3f);
+
+    const bool passed = noLimitOk && rampedOk && settledOk;
+    record ("attenuation mix ramps and settles", "L6", passed, Expect::Pass,
+            "at 100 dB " + std::to_string (atNoLimit) + " (want 0), after one block of a "
+              "100->0 change " + std::to_string (afterOneBlock)
+              + " (want a partial ramp), settled " + std::to_string (settled) + " (want 1)");
 }
 
 //==============================================================================
@@ -881,7 +957,8 @@ int main (int argc, char** argv)
     testMeterRepaintsOnlyOnChange();
     testMetersSeeAllChannels();
     testInvalidGeometryIsRefused();
-    testAttenuationSlew();
+    testAttenuationIsACrossfade();
+    testAttenuationMixIsSmoothedAndBounded();
     testStateSchema();
 
     int unexpected = 0;
