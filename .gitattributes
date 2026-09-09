@@ -1,0 +1,11 @@
+# Keep the licence byte-for-byte as fetched from gnu.org, so the SHA-256
+# recorded in the commit that added it stays verifiable after checkout on any
+# platform. Without this, core.autocrlf rewrites the line endings on Windows.
+LICENSE -text
+
+# Shell scripts and workflow files must keep LF: CI runs the staging and harness
+# steps through bash, including on the Windows runner, where CRLF in a heredoc
+# or a `for` list produces confusing failures.
+*.sh text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
