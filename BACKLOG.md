@@ -14,16 +14,18 @@ harness across five geometries (480/48000, 512/48000, 1024/48000, 512/44100, 102
 `pluginval` at strictness 5, and a packaging shape check, run identically locally and in CI on
 Windows, macOS and Linux.
 
-35 harness tests on the default build, 31 on each slim one. Every guard added this session was
+35 harness tests on the default build, 31 on each slim one. Every guard added during the
+2026-09-08/09 remediation was
 mutation tested: the guard was broken, the resulting failure was checked to name the right
 item, and the guard was restored. Those results are recorded in the commit messages rather
 than in a green run, because a green run proves nothing about whether the check can fail.
 
-What that discipline caught, in this repo, this session:
-- Three vacuous tests of my own. One counted `paint()` calls in a headless harness, where
+What that discipline caught in this repo, all of it in work done during the remediation rather
+than inherited from upstream:
+- Three newly written tests that could not fail. One counted `paint()` calls in a headless harness, where
   `paint()` never runs. One ran a refusal against a virgin processor whose latency was already
   zero. One wrapped its assertion in `if (xml != nullptr)`, so a typo would have reported PASS.
-- Three real defects of my own: a use-after-free between `worker.stop()` and `df_free`, an
+- Three defects introduced by the remediation itself: a use-after-free between `worker.stop()` and `df_free`, an
   unconditional `setLatencySamples` that reported 40 ms after a failed load, and attenuation
   left on the audio thread after I claimed it had moved.
 - A coverage gap that no amount of reading would have found: H6 measures the plugin at
@@ -113,7 +115,7 @@ Fix: `juce::TemporaryFile`, or skip the filesystem entirely per M4.
 
 **FIXED** (`388abbe`). Written fresh and deleted as soon as `df_create` has read it, which also
 closes M6. Confirmed in the wild: `%TEMP%lt_denoiser_model.tar.gz` had reached 582,768,928
-bytes, exactly 73 x 7,983,136, purely from this session's test runs. Deleted.
+bytes, exactly 73 x 7,983,136, purely from repeated test runs. Deleted.
 
 `Source/DeepFilterNetProcessor.cpp:32-41`
 

@@ -18,3 +18,31 @@ dist/
 *.pdb
 
 .DS_Store
+
+# Defence in depth. None of these exists here today, and nothing of this shape
+# has ever been committed, but the ignore file offered no protection if one ever
+# landed at the repo root. Cheaper than finding out.
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+*.key
+id_rsa*
+id_ed25519*
+.netrc
+.npmrc
+.pypirc
+
+# Agent and editor scratch, which belongs in a session directory rather than in
+# a public repo.
+.claude/
+CLAUDE.local.md
+.cursorrules
+.cursor/
+.aider*
+*.jsonl
+*.orig
+*.rej
+*.bak
+*~
