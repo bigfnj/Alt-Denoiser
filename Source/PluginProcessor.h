@@ -17,6 +17,11 @@ public:
     }
     
     void push(const float* data, int numSamples) {
+        // A default-constructed FIFO has an empty buffer, so `% buffer.size()`
+        // below is a division by zero and `buffer[writePos]` writes out of
+        // bounds. reset() could reach exactly that state after a refused
+        // prepareToPlay; a review probe crashed with exit 139.
+        if (buffer.empty() || numSamples <= 0) { jassertfalse; return; }
         for (int i = 0; i < numSamples; ++i) {
             buffer[writePos] = data[i];
             writePos = (writePos + 1) % buffer.size();
@@ -90,10 +95,25 @@ public:
     const juce::String getProgramName(int) override { return "Default"; }
     void changeProgramName(int, const juce::String&) override {}
 
+    /** L7: bumped whenever the saved shape changes incompatibly. A state
+        written by an OLDER build carries no attribute at all, reads as 0, and
+        still loads, so backwards compatibility is preserved. The version exists
+        for the forward direction: a state from a NEWER build is refused whole
+        rather than half-applied.
+    */
+    static constexpr int kStateSchemaVersion = 1;
+
     void getStateInformation(juce::MemoryBlock& destData) override
     {
         auto state = apvts.copyState();
         std::unique_ptr<juce::XmlElement> xml(state.createXml());
+
+        // No null check on xml: ValueTree::createXml() returns null only for an
+        // invalid tree, and apvts.copyState() is always valid, so the branch
+        // would be unreachable and could never be mutation-tested. Writing a
+        // zero-length block would also be worse than crashing, since a host
+        // cannot distinguish it from "this plugin has no state".
+        xml->setAttribute("schemaVersion", kStateSchemaVersion);
         copyXmlToBinary(*xml, destData);
     }
 
@@ -105,6 +125,14 @@ public:
         {
             if (xmlState->hasTagName(apvts.state.getType()))
             {
+                // Absent attribute reads 0, which is <= current, so states from
+                // builds predating this check still load.
+                if (xmlState->getIntAttribute("schemaVersion", 0) > kStateSchemaVersion)
+                {
+                    jassertfalse;   // written by a newer build; keep defaults
+                    return;
+                }
+
                 apvts.replaceState(juce::ValueTree::fromXml(*xmlState));
             }
         }
@@ -172,6 +200,7 @@ private:
     std::vector<float> resampleOutBuffer;
     std::vector<float> monoBuffer;   // H4: host-rate mono sum fed to the model
     int modelFrameLength = 480;      // M3: hop size reported by the loaded model
+    std::atomic<float>* attenParam = nullptr;   // L5: cached, not looked up per block
 
     // M1: latency-aligned dry signal, used when the worker has not produced a
     // hop in time. Emitting the delayed dry input is a dropout the listener may
@@ -194,6 +223,11 @@ public:
     */
     std::atomic<unsigned> fallbackSamples { 0 };
     int getWorkerDroppedFrames() const { return worker.getDroppedFrames(); }
+
+    /** L6: the attenuation limit actually pushed into the model so far,
+        which trails the parameter while a change is slewing.
+    */
+    float getAppliedAttenLim() const { return worker.getAppliedAttenLim(); }
 
 private:
 

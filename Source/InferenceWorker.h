@@ -129,7 +129,9 @@ public:
         framesAccepted.store (0, std::memory_order_relaxed);
         framesCollected.store (0, std::memory_order_relaxed);
         framesDroppedAfterAccept.store (0, std::memory_order_relaxed);
-        attenLimDirty.store (false, std::memory_order_relaxed);
+        // A fresh DFState is built at this value, so seeding it here means the
+        // first genuine difference is what triggers the first setAttenLim.
+        appliedAttenLim.store (100.0f, std::memory_order_relaxed);
 
         if (model != nullptr && size > 0)
         {
@@ -184,10 +186,12 @@ public:
     */
     void setAttenuationLimit (float db)
     {
-        pendingAttenLim.store (db, std::memory_order_relaxed);
-        attenLimDirty.store (true, std::memory_order_release);
+        pendingAttenLim.store (db, std::memory_order_release);
         wakeUp.signal();
     }
+
+    /** Test accessor: the value actually pushed into the model so far. */
+    float getAppliedAttenLim() const noexcept { return appliedAttenLim.load (std::memory_order_relaxed); }
 
     /** Audio thread. Retrieves one finished hop and the input sequence it came
         from, if the worker has produced one.
@@ -264,9 +268,20 @@ private:
             bool didWork = false;
 
             // Applied here rather than from the audio thread, so this stays the
-            // only thread that ever calls into the model.
-            if (attenLimDirty.exchange (false, std::memory_order_acquire))
-                model->setAttenLim (pendingAttenLim.load (std::memory_order_relaxed));
+            // only thread that ever calls into the model (H3).
+            //
+            // Deliberately NOT slewed. An earlier attempt rate-limited this and
+            // was reverted: the step landed once per worker WAKE-UP rather than
+            // per hop, so the rate swung with host buffer size and froze
+            // entirely at hop-aligned block sizes. See the revert commit.
+            {
+                const float target = pendingAttenLim.load (std::memory_order_relaxed);
+                if (! juce::approximatelyEqual (target, appliedAttenLim.load (std::memory_order_relaxed)))
+                {
+                    appliedAttenLim.store (target, std::memory_order_relaxed);
+                    model->setAttenLim (target);
+                }
+            }
 
             unsigned sequence = 0;
             while (inbound.pop (sequence, scratchIn.data()))
@@ -316,7 +331,9 @@ private:
     std::atomic<unsigned> framesCollected { 0 };
     std::atomic<unsigned> framesDroppedAfterAccept { 0 };
     std::atomic<float> pendingAttenLim { 100.0f };
-    std::atomic<bool>  attenLimDirty { false };
+
+    // Atomic because getAppliedAttenLim() is public and read from other threads.
+    std::atomic<float> appliedAttenLim { 100.0f };   // matches what df_create is given
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (InferenceWorker)
 };

@@ -9,6 +9,11 @@ AltDenoiserProcessor::AltDenoiserProcessor()
       apvts(*this, nullptr, "Parameters", createParameterLayout())
 {
     dfProcessor = std::make_unique<DeepFilterNetProcessor>(48000);
+
+    // L5: cached once. This was a string-keyed hash and lookup on the audio
+    // thread every single block.
+    attenParam = apvts.getRawParameterValue("atten_lim");
+    jassert(attenParam != nullptr);
 }
 
 AltDenoiserProcessor::~AltDenoiserProcessor() {
@@ -50,6 +55,23 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // Together they opened this window. releaseResources() already had the
     // right order, which is why the leak-and-teardown path never showed it.
     worker.stop();
+
+    // L8: refuse geometry that cannot work, before anything is constructed from
+    // it. A plugin scanner calling prepareToPlay(0, 0) previously produced an
+    // infinite resample ratio, and the resampler's inner loop
+    // (while acc >= target_sample_time) never terminates when the target sample
+    // time is infinite, so the host hangs rather than misbehaving.
+    //
+    // preparedBlockSize is cleared explicitly rather than left at whatever a
+    // previous prepare set, so the C5 guard in processBlock refuses every block
+    // and the plugin degrades to the H7 passthrough.
+    if (! (sampleRate >= 8000.0 && sampleRate <= 384000.0) || samplesPerBlock <= 0) {
+        jassertfalse;
+        preparedBlockSize = 0;
+        setLatencySamples(0);
+        modelLoaded.store(false, std::memory_order_release);
+        return;
+    }
 
     // Build the model: everything below is sized from what it reports.
     const bool loaded = dfProcessor->initialize();
@@ -260,7 +282,12 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         buffer.clear(i, 0, buffer.getNumSamples());
 
   if (modelAvailable) {
-    float newAttenLim = *apvts.getRawParameterValue("atten_lim");
+    // No null fallback: attenParam is set in the constructor from a parameter
+    // createParameterLayout guarantees exists, so the branch is unreachable. The
+    // fallback that was here returned 100.0f, which is the "No limit" sentinel,
+    // so a lookup failure would have silently applied MAXIMUM reduction forever
+    // while the UI showed the user's setting.
+    const float newAttenLim = attenParam->load(std::memory_order_relaxed);
     if (std::abs(newAttenLim - lastAttenLim) > 0.01f) {
         // H3 residue: published to the worker rather than applied here, because
         // the worker is concurrently inside processFrame on the same DFState.

@@ -674,6 +674,185 @@ void testMetersSeeAllChannels()
             "right-channel-only input, meter saw peak " + std::to_string (seen));
 }
 
+//==============================================================================
+// T15 / L8 - impossible geometry must be refused, not acted on.
+//
+// prepareToPlay(0, 0) previously produced an infinite resample ratio, and the
+// resampler's inner while loop never terminates when the target sample time is
+// infinite. The failure mode is a HUNG host, not wrong audio, which is why the
+// mutation test for this one cannot simply be "remove the guard and run".
+
+void testInvalidGeometryIsRefused()
+{
+    AltDenoiserProcessor proc;
+
+    // Prepare VALIDLY first. Without this the test is vacuous: a virgin
+    // processor already reports latency 0 with preparedBlockSize 0, so deleting
+    // the guard's clean-up leaves every assertion green. A review mutation
+    // proved exactly that.
+    prepare (proc);
+    const int latencyWhenValid = proc.getLatencySamples();
+
+    // Each of these must refuse and clear the state the valid prepare set.
+    proc.prepareToPlay (0.0, 0);
+    const int latencyAfterZero = proc.getLatencySamples();
+
+    // reset() after a refused prepare must not crash. The refusal returns before
+    // the FIFOs are sized, and reset() re-primes them; a review probe crashed
+    // here with exit 139 before SimpleFifo::push was hardened. Hosts reach this
+    // through the VST3 wrapper's setProcessing(false).
+    proc.reset();
+
+    // The geometry that actually detonates: a zero rate with a VALID block size
+    // is the only combination that reaches the resampler with an infinite
+    // source sample time. The original test never tried it.
+    proc.prepareToPlay (0.0, kBlockSize);
+    proc.reset();
+
+    proc.prepareToPlay (48000.0, -1);
+    proc.prepareToPlay (1.0, 512);          // below the supported floor
+
+    // With preparedBlockSize cleared, processBlock refuses every block and the
+    // H7 passthrough carries the audio.
+    juce::AudioBuffer<float> buffer (2, 512);
+    juce::MidiBuffer midi;
+    std::vector<float> before ((size_t) 512);
+    for (int i = 0; i < 512; ++i)
+    {
+        const auto v = 0.25f * (float) std::sin (juce::MathConstants<double>::twoPi * 440.0 * i / 48000.0);
+        buffer.setSample (0, i, v);
+        buffer.setSample (1, i, v);
+        before[(size_t) i] = v;
+    }
+    proc.processBlock (buffer, midi);
+
+    double maxDelta = 0.0;
+    for (int i = 0; i < 512; ++i)
+        maxDelta = std::max (maxDelta, (double) std::abs (buffer.getSample (0, i) - before[(size_t) i]));
+
+    // A valid prepare afterwards must still work: the refusal cannot leave the
+    // plugin permanently broken.
+    prepare (proc);
+    setAttenuation (proc, 0.0f);
+    double recovered = 0.0;
+    render (proc, 30,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [&recovered] (const juce::AudioBuffer<float>& b, int blk)
+            {
+                if (blk < 15) return;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    recovered = std::max (recovered, (double) std::abs (b.getSample (0, i)));
+            });
+
+    // latencyWhenValid > 0 is what makes the latencyAfterZero == 0 clause mean
+    // something: it proves the guard CLEARED a non-zero value rather than
+    // observing one that was already zero.
+    const bool passed = (latencyWhenValid > 0) && (latencyAfterZero == 0)
+                     && (maxDelta < 1.0e-6) && (recovered > 0.1);
+    record ("invalid geometry is refused", "L8", passed, Expect::Pass,
+            "latency when valid " + std::to_string (latencyWhenValid)
+              + " -> after refusal " + std::to_string (latencyAfterZero)
+              + ", survived reset() twice, passthrough delta " + std::to_string (maxDelta)
+              + ", recovered peak " + std::to_string (recovered));
+}
+
+//==============================================================================
+// T16 / L6 - attenuation changes are slew-limited, but a fresh model adopts the
+// real value at once.
+
+void testAttenuationSlew()
+{
+    AltDenoiserProcessor proc;
+    prepare (proc);
+
+    // Priming: a fresh DFState is created at a hardcoded 100 dB, so it must pick
+    // up the user's actual setting immediately rather than ramping to it. Not
+    // doing so would be H2 in a different costume: up to 1.7 s of the wrong
+    // attenuation after every prepare.
+    setAttenuation (proc, 0.0f);
+    render (proc, 8,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [] (const juce::AudioBuffer<float>&, int) {});
+    const float primed = proc.getAppliedAttenLim();
+
+    // A change during playback must reach the model promptly. Slewing was tried
+    // and reverted: see the revert commit.
+    setAttenuation (proc, 100.0f);
+    render (proc, 8,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [] (const juce::AudioBuffer<float>&, int) {});
+    const float ramping = proc.getAppliedAttenLim();
+
+    // Given long enough it must actually arrive, not stall short.
+    render (proc, 400,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [] (const juce::AudioBuffer<float>&, int) {});
+    const float arrived = proc.getAppliedAttenLim();
+
+    const bool primedOk  = (std::abs (primed) < 0.01f);
+    const bool changedOk = (std::abs (ramping - 100.0f) < 0.01f);
+    const bool arrivedOk = (std::abs (arrived - 100.0f) < 0.01f);
+
+    const bool passed = primedOk && changedOk && arrivedOk;
+    record ("attenuation reaches the model", "L6", passed, Expect::Pass,
+            "adopted " + std::to_string (primed)
+              + " (want 0), after a 0->100 change " + std::to_string (ramping)
+              + " (want 100), still " + std::to_string (arrived) + " (want 100)");
+}
+
+//==============================================================================
+// T17 / L7 - state round-trips, and a state from a newer build is refused whole.
+
+void testStateSchema()
+{
+    juce::MemoryBlock saved;
+    {
+        AltDenoiserProcessor proc;
+        setAttenuation (proc, 42.0f);
+        proc.getStateInformation (saved);
+    }
+
+    const bool wroteSomething = (saved.getSize() > 0);
+
+    float restored = -1.0f;
+    {
+        AltDenoiserProcessor proc;
+        proc.setStateInformation (saved.getData(), (int) saved.getSize());
+        restored = proc.apvts.getParameter ("atten_lim")->convertFrom0to1 (
+                       proc.apvts.getParameter ("atten_lim")->getValue());
+    }
+
+    // A state claiming a future schema must leave defaults untouched rather than
+    // loading half of it.
+    float afterFuture = -1.0f;
+    bool parsedFutureXml = false;
+    {
+        AltDenoiserProcessor proc;
+        auto xml = juce::parseXML (R"(<Parameters schemaVersion="99"><PARAM id="atten_lim" value="0.0"/></Parameters>)");
+        // Assert rather than branch: wrapping this in `if (xml != nullptr)` made
+        // a typo in the literal silently skip the only assertion that covers the
+        // version check, reporting PASS having exercised nothing.
+        jassert (xml != nullptr);
+        parsedFutureXml = (xml != nullptr);
+        if (xml != nullptr)
+        {
+            juce::MemoryBlock future;
+            juce::AudioProcessor::copyXmlToBinary (*xml, future);
+            proc.setStateInformation (future.getData(), (int) future.getSize());
+        }
+        afterFuture = proc.apvts.getParameter ("atten_lim")->convertFrom0to1 (
+                          proc.apvts.getParameter ("atten_lim")->getValue());
+    }
+
+    const bool roundTripped = std::abs (restored - 42.0f) < 0.5f;
+    const bool futureRefused = std::abs (afterFuture - 100.0f) < 0.5f;   // default survived
+    const bool passed = wroteSomething && roundTripped && futureRefused && parsedFutureXml;
+    record ("state round-trips and rejects the future", "L7", passed, Expect::Pass,
+            "saved " + std::to_string ((int) saved.getSize()) + " bytes, restored "
+              + std::to_string (restored) + " (want 42), after a schemaVersion=99 state "
+              + std::to_string (afterFuture) + " (want the 100 default)");
+}
+
 } // namespace
 
 //==============================================================================
@@ -701,6 +880,9 @@ int main (int argc, char** argv)
     testMeterHoldNeverDropsBelowBar();
     testMeterRepaintsOnlyOnChange();
     testMetersSeeAllChannels();
+    testInvalidGeometryIsRefused();
+    testAttenuationSlew();
+    testStateSchema();
 
     int unexpected = 0;
     for (const auto& r : results)
