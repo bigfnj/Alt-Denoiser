@@ -112,44 +112,85 @@ jobs:
         shell: bash
         run: bash scripts/gate.sh build
 
-      # Ship only the VST3 bundle. The build tree also contains a ~44 MB
+      # Ship only the plugin bundles. The build tree also contains a ~44 MB
       # _SharedCode.lib link intermediate and MSVC .exp/.lib stubs, which were
       # previously published and are unusable to end users.
       #
-      # The bundle is located rather than hardcoded: the artefacts directory
+      # One directory per format, uploaded as its own artifact, because
+      # BACKLOG.md PKG1 measured that a combined zip makes every user fetch
+      # every format: zip's 32 KB window cannot deduplicate the model and the
+      # runtime across near-identical binaries.
+      #
+      # Each bundle is located rather than hardcoded: the artefacts directory
       # differs between single- and multi-config generators, and this path has
       # never been verified on macOS or Linux. Missing or ambiguous results are
       # a hard failure, because the previous workflow would have silently
-      # published an empty archive.
-      - name: Stage VST3 for packaging
+      # published an empty archive. Every shipped format gets that same guard,
+      # not just VST3.
+      #
+      # AU is a `.component/` directory and LV2 a `.lv2/` directory holding the
+      # .so plus its .ttl manifests, so both match the -type d -prune idiom.
+      - name: Stage plugin formats for packaging
         shell: bash
         run: |
           set -eu
-          count=$(find build -type d -name '*.vst3' -prune -print | wc -l | tr -d ' ')
-          if [ "$count" != "1" ]; then
-            echo "::error::expected exactly one .vst3 bundle in build/, found $count"
-            find build -maxdepth 3 -type d || true
-            exit 1
-          fi
-          bundle=$(find build -type d -name '*.vst3' -prune -print)
-          echo "Found bundle: $bundle"
-          mkdir -p dist
-          cp -R "$bundle" dist/
 
-          # LIC1: this is an AGPLv3 work, so the licence must travel with the
-          # binary. Upstream published releases with no licence text at all,
-          # because the repository had no LICENSE file to include.
-          test -f LICENSE || { echo "::error::LICENSE is missing"; exit 1; }
-          cp LICENSE dist/
-          cp README.md dist/
+          stage_one() {
+            ext="$1"
+            count=$(find build -type d -name "*.$ext" -prune -print | wc -l | tr -d ' ')
+            if [ "$count" != "1" ]; then
+              echo "::error::expected exactly one .$ext bundle in build/, found $count"
+              find build -maxdepth 3 -type d || true
+              exit 1
+            fi
+            bundle=$(find build -type d -name "*.$ext" -prune -print)
+            echo "Found $ext bundle: $bundle"
+            mkdir -p "dist/$ext"
+            cp -R "$bundle" "dist/$ext/"
+
+            # LIC1: this is an AGPLv3 work, so the licence must travel with the
+            # binary. Upstream published releases with no licence text at all,
+            # because the repository had no LICENSE file to include. Each format
+            # is downloaded on its own, so each one carries its own copy.
+            test -f LICENSE || { echo "::error::LICENSE is missing"; exit 1; }
+            cp LICENSE "dist/$ext/"
+            cp README.md "dist/$ext/"
+          }
+
+          case "$RUNNER_OS" in
+            Windows) formats="vst3" ;;
+            macOS)   formats="vst3 component" ;;
+            Linux)   formats="vst3 lv2" ;;
+            *)       echo "::error::unsupported runner OS: $RUNNER_OS"; exit 1 ;;
+          esac
+
+          for ext in $formats; do
+            stage_one "$ext"
+          done
 
           find dist -type f -print
 
-      - name: Upload artifact
+      - name: Upload VST3 artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Alt-Denoiser-${{ matrix.name }}
-          path: dist/
+          name: Alt-Denoiser-${{ matrix.name }}-VST3
+          path: dist/vst3/
+          if-no-files-found: error
+
+      - name: Upload AU artifact
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Alt-Denoiser-${{ matrix.name }}-AU
+          path: dist/component/
+          if-no-files-found: error
+
+      - name: Upload LV2 artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Alt-Denoiser-${{ matrix.name }}-LV2
+          path: dist/lv2/
           if-no-files-found: error
 
   release:
