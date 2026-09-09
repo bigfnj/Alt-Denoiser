@@ -319,6 +319,9 @@ private:
     // and lives in the 48 kHz domain, so bypassing through it would collapse the
     // channels and pass the signal through the resampler twice.
     juce::AudioParameterBool* bypassParam = nullptr;
+
+    // 7b: read in prepareToPlay only. Never touched from processBlock.
+    juce::AudioParameterChoice* modelParam = nullptr;
     std::vector<SimpleFifo> bypassDelay;
     std::vector<float> bypassScratch;
     juce::SmoothedValue<float> bypassMix;          // 0 = processed, 1 = bypassed

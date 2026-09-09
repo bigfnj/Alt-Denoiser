@@ -20,6 +20,10 @@ AltDenoiserProcessor::AltDenoiserProcessor()
 
     bypassParam = dynamic_cast<juce::AudioParameterBool*>(apvts.getParameter("bypass"));
     jassert(bypassParam != nullptr);
+
+    // 7b: read only in prepareToPlay, never on the audio thread.
+    modelParam = dynamic_cast<juce::AudioParameterChoice*>(apvts.getParameter("model"));
+    jassert(modelParam != nullptr);
 }
 
 AltDenoiserProcessor::~AltDenoiserProcessor() {
@@ -52,6 +56,38 @@ juce::AudioProcessorValueTreeState::ParameterLayout AltDenoiserProcessor::create
     // and existing automation survives.
     layout.add(std::make_unique<juce::AudioParameterBool>(
         juce::ParameterID { "bypass", 1 }, "Bypass", false));
+
+    // 7b: the model choice.
+    //
+    // NOT automatable. It only takes effect on the next prepareToPlay, because
+    // the two archives report different latencies (1920 against 960) and a
+    // plugin changing its reported latency mid-session is among the least
+    // reliably handled things in VST3. A control whose value does nothing until
+    // the plugin reloads has no business in an automation lane.
+    //
+    // Both choices are always offered even in a slim build that embedded only
+    // one archive, so the parameter's normalised mapping is identical across
+    // builds and a session saved by a full build restores its selection rather
+    // than being clamped into a different model. DeepFilterNetProcessor falls
+    // back if the chosen archive is not present, and the editor hides the row.
+    //
+    // The default is the first archive this build embedded, which is Standard in
+    // any build that has it. That keeps an existing session with no
+    // <PARAM id="model"> restoring to exactly the behaviour it was saved with,
+    // since replaceState leaves an absent parameter at its constructed default,
+    // AND keeps a lowlatency-only build honest: defaulting to Standard there
+    // would have the parameter report a model the plugin silently did not
+    // load.
+    juce::StringArray modelNames;
+    for (int i = 0; i < kNumDfnModels; ++i)
+        modelNames.add(DeepFilterNetProcessor::getModelDisplayName(static_cast<DfnModel>(i)));
+
+    layout.add(std::make_unique<juce::AudioParameterChoice>(
+        juce::ParameterID { "model", 1 },
+        "Model",
+        modelNames,
+        (int) DeepFilterNetProcessor::getFirstAvailableModel(),
+        juce::AudioParameterChoiceAttributes().withAutomatable(false)));
 
     return layout;
 }
@@ -88,7 +124,14 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     }
 
     // Build the model: everything below is sized from what it reports.
-    const bool loaded = dfProcessor->initialize();
+    //
+    // 7b: the choice is read HERE and nowhere else. Changing it while the plugin
+    // is running does nothing until the host next calls prepareToPlay, which is
+    // exactly the contract the parameter documents.
+    const auto requested = modelParam != nullptr
+                             ? static_cast<DfnModel>(modelParam->getIndex())
+                             : DfnModel::Standard;
+    const bool loaded = dfProcessor->initialize(requested);
 
     // M3: take the hop size from the model rather than assuming 480. Every
     // archive libDF can load uses 480 today, but df_process_frame builds its

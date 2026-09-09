@@ -18,10 +18,96 @@ void DeepFilterNetProcessor::release()
     processFailures = 0;
 }
 
-bool DeepFilterNetProcessor::initialize()
+// Which archives this build embedded. Set from CMake's ALTDENOISER_MODELS.
+// Defaulted here so the file still compiles if it is ever built outside that
+// CMakeLists, rather than silently taking a branch nobody intended.
+#ifndef ALTDENOISER_HAS_STANDARD_MODEL
+ #define ALTDENOISER_HAS_STANDARD_MODEL 1
+#endif
+#ifndef ALTDENOISER_HAS_LL_MODEL
+ #define ALTDENOISER_HAS_LL_MODEL 0
+#endif
+
+#if ! (ALTDENOISER_HAS_STANDARD_MODEL || ALTDENOISER_HAS_LL_MODEL)
+ #error "No model archive was embedded. Check ALTDENOISER_MODELS."
+#endif
+
+const char* DeepFilterNetProcessor::getModelDisplayName (DfnModel which) noexcept
 {
-    return initializeFromMemory (AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gz,
-                                 AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gzSize);
+    switch (which)
+    {
+        case DfnModel::Standard:   return "Standard";
+        case DfnModel::LowLatency: return "Low latency";
+    }
+    return "Standard";
+}
+
+bool DeepFilterNetProcessor::isModelAvailable (DfnModel which) noexcept
+{
+    switch (which)
+    {
+        case DfnModel::Standard:   return ALTDENOISER_HAS_STANDARD_MODEL != 0;
+        case DfnModel::LowLatency: return ALTDENOISER_HAS_LL_MODEL != 0;
+    }
+    return false;
+}
+
+const char* DeepFilterNetProcessor::getEmbeddedModel (DfnModel which, int& sizeOut) noexcept
+{
+    sizeOut = 0;
+
+    switch (which)
+    {
+        case DfnModel::Standard:
+           #if ALTDENOISER_HAS_STANDARD_MODEL
+            sizeOut = AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gzSize;
+            return AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gz;
+           #else
+            return nullptr;
+           #endif
+
+        case DfnModel::LowLatency:
+           #if ALTDENOISER_HAS_LL_MODEL
+            sizeOut = AltDenoiserBinaryData::DeepFilterNet3_ll_onnx_tar_gzSize;
+            return AltDenoiserBinaryData::DeepFilterNet3_ll_onnx_tar_gz;
+           #else
+            return nullptr;
+           #endif
+    }
+
+    return nullptr;
+}
+
+DfnModel DeepFilterNetProcessor::getFirstAvailableModel() noexcept
+{
+    for (int i = 0; i < kNumDfnModels; ++i)
+        if (isModelAvailable (static_cast<DfnModel> (i)))
+            return static_cast<DfnModel> (i);
+
+    jassertfalse;   // unreachable: CMake refuses to configure with no models
+    return DfnModel::Standard;
+}
+
+bool DeepFilterNetProcessor::initialize (DfnModel which)
+{
+    // A build that did not embed the requested archive falls back to one it did,
+    // rather than refusing to load anything. Losing 20 ms of latency
+    // improvement is a far better outcome than a silent bypass, and the
+    // alternative would make a session saved by a full build unusable in a slim
+    // one.
+    if (! isModelAvailable (which))
+    {
+        DBG ("Model '" << getModelDisplayName (which) << "' is not embedded in this build; falling back");
+        which = getFirstAvailableModel();
+    }
+
+    int size = 0;
+    const char* data = getEmbeddedModel (which, size);
+
+    const bool ok = initializeFromMemory (data, size);
+    if (ok)
+        loadedModel = which;
+    return ok;
 }
 
 bool DeepFilterNetProcessor::initializeFromMemory (const void* modelData, int modelSize)

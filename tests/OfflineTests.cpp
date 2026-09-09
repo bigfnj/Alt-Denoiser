@@ -29,7 +29,6 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 #include "DeepFilterNetProcessor.h"
-#include "BinaryData.h"
 
 namespace
 {
@@ -103,6 +102,23 @@ void setAttenuation (AltDenoiserProcessor& proc, float valueDb)
     auto* param = proc.apvts.getParameter ("atten_lim");
     jassert (param != nullptr);
     param->setValueNotifyingHost (param->convertTo0to1 (valueDb));
+}
+
+/** Selects the model. Must be called BEFORE prepare: the choice is read in
+    prepareToPlay and nowhere else, which is the whole point of it not being
+    automatable.
+*/
+void setModel (AltDenoiserProcessor& proc, DfnModel which)
+{
+    auto* param = proc.apvts.getParameter ("model");
+    jassert (param != nullptr);
+    param->setValueNotifyingHost (param->convertTo0to1 ((float) (int) which));
+}
+
+/** Suffix for a test name, so the two models' results are told apart. */
+std::string modelTag (DfnModel which)
+{
+    return std::string (" [") + DeepFilterNetProcessor::getModelDisplayName (which) + "]";
 }
 
 void fillSine (juce::AudioBuffer<float>& buffer, int block, float freqL, float freqR)
@@ -1046,9 +1062,13 @@ void testCorruptModelDegradesToBypass()
         if (! ok) failures.push_back (what);
     };
 
+    // Whichever archive this build embedded. Naming a specific BinaryData
+    // symbol here breaks the slim builds, which is how ALTDENOISER_MODELS=
+    // lowlatency failed to compile the first time.
+    int goodSize = 0;
     const auto* good = reinterpret_cast<const uint8_t*> (
-                           AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gz);
-    const int goodSize = AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gzSize;
+        DeepFilterNetProcessor::getEmbeddedModel (
+            DeepFilterNetProcessor::getFirstAvailableModel(), goodSize));
 
     check (good != nullptr && goodSize > 4096, "the embedded model should be present");
 
@@ -1119,7 +1139,8 @@ void testCorruptModelDegradesToBypass()
     {
         DeepFilterNetProcessor p;
         check (! p.initializeFromMemory (good, 64), "a 64-byte archive should be refused");
-        check (p.initialize(), "the real model should load after a refused one");
+        check (p.initialize (DeepFilterNetProcessor::getFirstAvailableModel()),
+               "the real model should load after a refused one");
         check (p.isReady(), "the real model should report ready");
         check (p.getFrameLength() == 480, "the loaded model should report a 480-sample hop");
     }
@@ -1130,7 +1151,7 @@ void testCorruptModelDegradesToBypass()
     record ("corrupt model degrades to bypass", "C1/C2", failures.empty(), Expect::Pass, detail);
 }
 
-void testLatencyIsDerivedFromTheModel()
+void testLatencyIsDerivedFromTheModel (DfnModel which)
 {
     // 7a. The reported latency used to be a 1920 literal in three places plus a
     // fourth copy inside getTailLengthSeconds. Correct for the standard archive,
@@ -1139,11 +1160,12 @@ void testLatencyIsDerivedFromTheModel()
     // reporting a constant anyway.
 
     DeepFilterNetProcessor probe;
-    const bool probeLoaded = probe.initialize();
+    const bool probeLoaded = probe.initialize (which);
     const int expected48k = probe.getModelDelaySamples() + (int) probe.getFrameLength();
     const int expectedHost = juce::roundToInt (expected48k * (kSampleRate / 48000.0));
 
     AltDenoiserProcessor proc;
+    setModel (proc, which);
     prepare (proc);
     const int reported = proc.getLatencySamples();
     const double tail  = proc.getTailLengthSeconds();
@@ -1165,7 +1187,7 @@ void testLatencyIsDerivedFromTheModel()
     const bool passed = probeLoaded && (reported == expectedHost)
                      && tailAgrees && refusedIsZero;
 
-    record ("latency is derived from the model", "7a", passed, Expect::Pass,
+    record ("latency is derived from the model" + modelTag (which), "7a", passed, Expect::Pass,
             "model delay " + std::to_string (probe.getModelDelaySamples())
               + " + hop " + std::to_string ((int) probe.getFrameLength())
               + " = " + std::to_string (expected48k) + " at 48k -> "
@@ -1177,7 +1199,7 @@ void testLatencyIsDerivedFromTheModel()
               + std::to_string (refused.getTailLengthSeconds()));
 }
 
-void testDryAndWetArriveTogether()
+void testDryAndWetArriveTogether (DfnModel which)
 {
     // 7a, and the gap mutation testing exposed.
     //
@@ -1211,10 +1233,11 @@ void testDryAndWetArriveTogether()
     const int burstLength = 4800;
     const int totalSamples = 60000;
 
-    auto renderBurst = [burstStart, burstLength, totalSamples]
+    auto renderBurst = [burstStart, burstLength, totalSamples, which]
                        (float attenDb, std::vector<float>& in, std::vector<float>& out)
     {
         AltDenoiserProcessor proc;
+        setModel (proc, which);
         prepare (proc);
         setAttenuation (proc, attenDb);
 
@@ -1303,21 +1326,28 @@ void testDryAndWetArriveTogether()
     const int dryLag = bestLag (dryIn, dryOut);
     const int wetLag = bestLag (wetIn, wetOut);
 
-    // Six bins. One for the decimation itself, the rest for the model's edge
-    // shaping, which biases the wet peak two bins early at 48 kHz and four at
-    // 96 kHz, where the 2:1 resampling adds its own smearing. Measured actuals
-    // are 128 samples at 48 kHz and 512 at 96 kHz; four bins put 96 kHz exactly
-    // on the boundary, which is not a margin.
+    // The tolerance comes from the model's ANALYSIS WINDOW, not from a bin
+    // count. The wet peak is biased early by the model's edge shaping, and that
+    // shaping is bounded by the window: half of one, plus a bin for the
+    // decimation itself. A fixed bin count does not work because the bias
+    // scales with the window while the latency does not; six bins put the
+    // low-latency model exactly on the boundary, which is not a margin.
     //
-    // This is still far tighter than the error it guards against: dropping the
-    // lookahead term moves the wet lag 832 samples at 48 kHz and 1408 at 96 kHz,
-    // against tolerances of 384 and 768.
-    const int tolerance = 6 * decim;
+    // Measured biases against a 544-sample tolerance at 48 kHz: standard 128,
+    // low latency 384. The low-latency model is the bigger network and shapes
+    // edges harder.
+    //
+    // Still far tighter than the error it guards: dropping the lookahead term
+    // from the derivation moves the wet lag 832 samples at 48 kHz.
+    DeepFilterNetProcessor geometry;
+    geometry.initialize (which);
+    const int halfWindow = (int) geometry.getInfo().fft_size / 2;
+    const int tolerance  = juce::roundToInt (halfWindow * (kSampleRate / 48000.0)) + decim;
     const bool dryOk = std::abs (dryLag - reported) <= tolerance;
     const bool wetOk = std::abs (wetLag - reported) <= tolerance;
 
     const bool passed = dryOk && wetOk;
-    record ("dry and wet paths arrive together", "7a", passed, Expect::Pass,
+    record ("dry and wet paths arrive together" + modelTag (which), "7a", passed, Expect::Pass,
             "reported " + std::to_string (reported)
               + ", dry envelope lag " + std::to_string (dryLag)
               + ", wet envelope lag " + std::to_string (wetLag)
@@ -1325,7 +1355,7 @@ void testDryAndWetArriveTogether()
               + ", tolerance " + std::to_string (tolerance) + ")");
 }
 
-void testModelMetadataIsReported()
+void testModelMetadataIsReported (DfnModel which)
 {
     // libDF's C API exposed only the hop size, which is why the plugin's
     // reported latency had to be the hardcoded 1920. alt_df_info reports the
@@ -1333,29 +1363,35 @@ void testModelMetadataIsReported()
     // against the model that is actually embedded.
 
     DeepFilterNetProcessor p;
-    const bool loaded = p.initialize();
+    const bool loaded = p.initialize (which);
     const auto& info = p.getInfo();
 
     const int modelDelay = p.getModelDelaySamples();
     const int derived    = modelDelay + (int) info.hop_size;   // + the plugin's own cushion
 
+    // Both archives share sr/hop/fft; only lookahead differs, which is exactly
+    // why a swap needs no resizing and why the latency cannot be a constant.
+    const unsigned expectedLookahead = (which == DfnModel::Standard) ? 2u : 0u;
+    const int expectedDerived        = (which == DfnModel::Standard) ? 1920 : 960;
+
     const bool passed = loaded
+                     && p.getLoadedModel() == which
                      && info.sr == 48000u
                      && info.hop_size == 480u
                      && info.fft_size == 960u
-                     && info.lookahead == 2u
+                     && info.lookahead == expectedLookahead
                      && info.ch == 1u
-                     && modelDelay == 1440
-                     && derived == 1920;
+                     && derived == expectedDerived;
 
-    record ("model metadata is reported", "C2", passed, Expect::Pass,
+    record ("model metadata is reported" + modelTag (which), "C2", passed, Expect::Pass,
             "sr " + std::to_string (info.sr)
               + ", hop " + std::to_string (info.hop_size)
               + ", fft " + std::to_string (info.fft_size)
               + ", lookahead " + std::to_string (info.lookahead)
               + ", ch " + std::to_string (info.ch)
               + " -> model delay " + std::to_string (modelDelay)
-              + ", derived latency " + std::to_string (derived) + " (want 1920)");
+              + ", derived latency " + std::to_string (derived)
+              + " (want " + std::to_string (expectedDerived) + ")");
 }
 
 void testWrongFrameLengthIsRefused()
@@ -1375,11 +1411,13 @@ void testWrongFrameLengthIsRefused()
         if (! ok) failures.push_back (what);
     };
 
+    int modelSize = 0;
+    const char* modelData = DeepFilterNetProcessor::getEmbeddedModel (
+        DeepFilterNetProcessor::getFirstAvailableModel(), modelSize);
+
     AltDf* st = nullptr;
-    const auto created = alt_df_create (
-        reinterpret_cast<const uint8_t*> (AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gz),
-        (size_t) AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gzSize,
-        100.0f, &st);
+    const auto created = alt_df_create (reinterpret_cast<const uint8_t*> (modelData),
+                                        (size_t) modelSize, 100.0f, &st);
 
     check (created == ALT_DF_OK && st != nullptr, "the model should load");
 
@@ -1425,6 +1463,90 @@ void testWrongFrameLengthIsRefused()
         ? std::string ("short, long, and null arguments all refused; correct call still works")
         : (std::to_string (failures.size()) + " failed: " + failures.front());
     record ("wrong frame length is refused", "M3", failures.empty(), Expect::Pass, detail);
+}
+
+void testModelChoiceIsExposedAndDeferred()
+{
+    // 7b. Three separate claims, each of which a user could be bitten by.
+
+    std::vector<std::string> failures;
+    auto check = [&failures] (bool ok, const char* what)
+    {
+        if (! ok) failures.push_back (what);
+    };
+
+    // 1. The parameter exists, defaults to Standard, and is NOT automatable.
+    //    Automatable would put a control in the lane whose value does nothing
+    //    until the plugin reloads, which is worse than not offering it.
+    {
+        AltDenoiserProcessor proc;
+        auto* param = proc.apvts.getParameter ("model");
+        check (param != nullptr, "the model parameter should exist");
+
+        if (param != nullptr)
+        {
+            auto* choice = dynamic_cast<juce::AudioParameterChoice*> (param);
+            check (choice != nullptr, "the model parameter should be a choice");
+            check (choice != nullptr
+                     && choice->getIndex() == (int) DeepFilterNetProcessor::getFirstAvailableModel(),
+                   "the model parameter should default to the first embedded model");
+            check (! param->isAutomatable(), "the model parameter must not be automatable");
+            check (choice != nullptr && choice->choices.size() == kNumDfnModels,
+                   "both choices must be offered even in a slim build");
+        }
+    }
+
+    // 2. It survives a state round-trip. This is the whole reason it is a real
+    //    parameter rather than a member: a session must reopen on the model it
+    //    was mixed with.
+    bool restored = false;
+    {
+        AltDenoiserProcessor proc;
+        setModel (proc, DfnModel::LowLatency);
+        juce::MemoryBlock saved;
+        proc.getStateInformation (saved);
+
+        AltDenoiserProcessor fresh;
+        fresh.setStateInformation (saved.getData(), (int) saved.getSize());
+        auto* choice = dynamic_cast<juce::AudioParameterChoice*> (fresh.apvts.getParameter ("model"));
+        restored = (choice != nullptr) && (choice->getIndex() == (int) DfnModel::LowLatency);
+        check (restored, "the model choice should survive a state round-trip");
+    }
+
+    // 3. DEFERRED. Changing it mid-session must not move the reported latency,
+    //    because a plugin that changes its latency while the transport is
+    //    running is handled inconsistently by hosts and is the reason this
+    //    applies on reload at all. It must then take effect on the NEXT prepare.
+    {
+        AltDenoiserProcessor proc;
+        setModel (proc, DeepFilterNetProcessor::getFirstAvailableModel());
+        prepare (proc);
+        const int before = proc.getLatencySamples();
+
+        setModel (proc, DfnModel::LowLatency);
+        const int afterChange = proc.getLatencySamples();
+        check (afterChange == before, "changing the model must not move latency mid-session");
+
+        prepare (proc);      // the host re-preparing is what applies it
+        const int afterPrepare = proc.getLatencySamples();
+
+        // Only a build carrying BOTH archives can actually switch. A slim build
+        // falls back to what it has, so the latency does not move: asserting
+        // otherwise is what made ALTDENOISER_MODELS=lowlatency report a failure
+        // that was the test's fault rather than the plugin's.
+        const bool bothEmbedded = DeepFilterNetProcessor::isModelAvailable (DfnModel::Standard)
+                               && DeepFilterNetProcessor::isModelAvailable (DfnModel::LowLatency);
+
+        if (bothEmbedded)
+            check (afterPrepare < before, "re-preparing should adopt the low-latency model");
+        else
+            check (afterPrepare == before, "a slim build should fall back, leaving latency alone");
+    }
+
+    const std::string detail = failures.empty()
+        ? std::string ("exposed, non-automatable, defaults to the first embedded model, round-trips, applies only on prepare")
+        : (std::to_string (failures.size()) + " failed: " + failures.front());
+    record ("model choice is exposed and deferred", "7b", failures.empty(), Expect::Pass, detail);
 }
 
 //==============================================================================
@@ -1599,9 +1721,24 @@ int main (int argc, char** argv)
     testBypassToggleDoesNotClick();
     testBypassParameterIsExposedAndSaved();
     testCorruptModelDegradesToBypass();
-    testModelMetadataIsReported();
-    testLatencyIsDerivedFromTheModel();
-    testDryAndWetArriveTogether();
+    for (int m = 0; m < kNumDfnModels; ++m)
+    {
+        const auto which = static_cast<DfnModel> (m);
+
+        // A slim build embeds one archive and falls back for the other, so
+        // asserting the fallback's geometry would assert the wrong thing.
+        if (! DeepFilterNetProcessor::isModelAvailable (which))
+        {
+            std::printf ("  SKIPPED: the %s model is not embedded in this build.\n",
+                         DeepFilterNetProcessor::getModelDisplayName (which));
+            continue;
+        }
+
+        testModelMetadataIsReported (which);
+        testLatencyIsDerivedFromTheModel (which);
+        testDryAndWetArriveTogether (which);
+    }
+    testModelChoiceIsExposedAndDeferred();
     testWrongFrameLengthIsRefused();
 
     int unexpected = 0;

@@ -101,10 +101,43 @@ endif()
 add_subdirectory(${JUCE_DIR})
 
 # binary data
+#
+# 7b: which archives get embedded is a build option, because the low-latency one
+# is not a small addition. Measured uncompressed: standard 8.59 MB against
+# low-latency 39.0 MB, and the ONNX graphs behind them are 256 vs 512
+# emb_hidden_dim and 2 vs 3 df_num_layers. "Low latency" names its 960-sample
+# algorithmic delay against the standard model's 1920; it is the BIGGER and
+# SLOWER network, which is the opposite of what the name suggests.
+#
+# Both by default, so the plugin can show the trade-off rather than describe it.
+set(ALTDENOISER_MODELS "both" CACHE STRING
+    "Which model archives to embed: both, standard, lowlatency")
+set_property(CACHE ALTDENOISER_MODELS PROPERTY STRINGS both standard lowlatency)
+
+set(MODEL_SOURCES "")
+set(ALTDENOISER_HAS_STANDARD 0)
+set(ALTDENOISER_HAS_LL 0)
+
+if(ALTDENOISER_MODELS STREQUAL "both" OR ALTDENOISER_MODELS STREQUAL "standard")
+    list(APPEND MODEL_SOURCES ${DFNET_DIR}/models/DeepFilterNet3_onnx.tar.gz)
+    set(ALTDENOISER_HAS_STANDARD 1)
+endif()
+if(ALTDENOISER_MODELS STREQUAL "both" OR ALTDENOISER_MODELS STREQUAL "lowlatency")
+    list(APPEND MODEL_SOURCES ${DFNET_DIR}/models/DeepFilterNet3_ll_onnx.tar.gz)
+    set(ALTDENOISER_HAS_LL 1)
+endif()
+
+if(NOT MODEL_SOURCES)
+    message(FATAL_ERROR
+        "ALTDENOISER_MODELS was '${ALTDENOISER_MODELS}'. It must be one of: both, standard, lowlatency.")
+endif()
+
+message(STATUS "Alt Denoiser: embedding models -> ${ALTDENOISER_MODELS}")
+
 juce_add_binary_data(AltDenoiserAssets
     NAMESPACE AltDenoiserBinaryData
     SOURCES
-        ${DFNET_DIR}/models/DeepFilterNet3_onnx.tar.gz
+        ${MODEL_SOURCES}
 )
 
 # format
@@ -134,6 +167,8 @@ juce_add_plugin(AltDenoiserPlugin
 )
 
 target_compile_definitions(AltDenoiserPlugin PUBLIC
+    ALTDENOISER_HAS_STANDARD_MODEL=${ALTDENOISER_HAS_STANDARD}
+    ALTDENOISER_HAS_LL_MODEL=${ALTDENOISER_HAS_LL}
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_VST3_CAN_REPLACE_VST2=0
@@ -197,6 +232,8 @@ target_sources(AltDenoiserTests PRIVATE
 )
 
 target_compile_definitions(AltDenoiserTests PRIVATE
+    ALTDENOISER_HAS_STANDARD_MODEL=${ALTDENOISER_HAS_STANDARD}
+    ALTDENOISER_HAS_LL_MODEL=${ALTDENOISER_HAS_LL}
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_STANDALONE_APPLICATION=1

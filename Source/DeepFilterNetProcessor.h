@@ -11,8 +11,50 @@
     libDF C API could not do that: df_create returned a Box and never NULL, and
     both it and df_process_frame ended in .expect().
 */
+/** Which embedded archive to load.
+
+    Both share sr 48000, hop 480 and fft 960, so a swap needs no resampler
+    change, no FIFO resize and no reallocation. Only `lookahead` differs, 2
+    against 0, which moves the derived latency from 1920 to 960.
+
+    Do not renumber: the values are the AudioParameterChoice indices and are
+    persisted in saved sessions.
+*/
+enum class DfnModel
+{
+    Standard   = 0,
+    LowLatency = 1
+};
+
+inline constexpr int kNumDfnModels = 2;
+
 class DeepFilterNetProcessor {
 public:
+    /** Human-readable name, as shown in the parameter and the editor. Valid for
+        every enumerator whether or not that archive was embedded.
+    */
+    static const char* getModelDisplayName (DfnModel which) noexcept;
+
+    /** Whether this build actually embedded that archive.
+
+        The parameter always offers both choices regardless, so a session saved
+        by a full build still restores its selection into a slim one instead of
+        being clamped into a different model. A slim build hides the row in the
+        editor and falls back to whatever it does have.
+    */
+    static bool isModelAvailable (DfnModel which) noexcept;
+
+    /** The embedded archive's bytes, or nullptr/0 if this build did not embed
+        it. The only place BinaryData is named, so nothing else has to be
+        recompiled against which archives a given build happens to carry.
+    */
+    static const char* getEmbeddedModel (DfnModel which, int& sizeOut) noexcept;
+
+    /** The first archive this build actually embedded. Always valid: CMake
+        refuses to configure with none, and a #error backs that up.
+    */
+    static DfnModel getFirstAvailableModel() noexcept;
+
     DeepFilterNetProcessor() = default;
     ~DeepFilterNetProcessor();
 
@@ -22,7 +64,12 @@ public:
     /** Loads the embedded model. Returns false and leaves the object unusable
         if the archive cannot be read; the caller is expected to bypass.
     */
-    bool initialize();
+    bool initialize (DfnModel which = DfnModel::Standard);
+
+    /** Which model actually got loaded. Not necessarily what was asked for: a
+        build that did not embed the requested archive falls back.
+    */
+    DfnModel getLoadedModel() const noexcept { return loadedModel; }
 
     /** Loads a model from an arbitrary buffer.
 
@@ -87,5 +134,6 @@ private:
     AltDf*      state  = nullptr;
     AltDfInfo   info   {};
     AltDfStatus lastStatus = ALT_DF_OK;
+    DfnModel    loadedModel = DfnModel::Standard;
     int         processFailures = 0;
 };
