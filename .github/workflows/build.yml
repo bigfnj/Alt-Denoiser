@@ -41,7 +41,12 @@ jobs:
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
+          # apt-get update exits 100 if ANY index fails, including third-party
+          # repos preinstalled on the runner image that this project does not
+          # use. A Chrome repo hash-sum mismatch failed a build here once. Index
+          # errors are downgraded to a visible warning and the install below is
+          # the real gate: it still fails loudly if a package we need is missing.
+          sudo apt-get update -o Acquire::Retries=3             || echo "::warning::apt-get update reported index errors; continuing, the install step gates this"
           sudo apt-get install -y \
             libasound2-dev \
             libfreetype6-dev \
