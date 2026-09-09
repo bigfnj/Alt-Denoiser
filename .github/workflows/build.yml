@@ -83,32 +83,34 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel 4
 
-      # pluginval passes this plugin at strictness 5 with serious audio defects
-      # present, because it validates VST3 well-formedness rather than audio
-      # correctness. This harness renders audio and asserts on the samples.
-      - name: Run offline harness
+      # Download pluginval so the gate runs its format-validation stage.
+      # Version-pinned: 1.0.3 is the version whose behaviour this project has
+      # actually measured.
+      - name: Install pluginval
         shell: bash
         run: |
           set -eu
-          exe=$(find build -type f \( -name AltDenoiserTests -o -name AltDenoiserTests.exe \) | head -n 1)
+          case "$RUNNER_OS" in
+            Windows) asset=pluginval_Windows.zip ;;
+            macOS)   asset=pluginval_macOS.zip ;;
+            Linux)   asset=pluginval_Linux.zip ;;
+          esac
+          curl -fsSL -o pv.zip             "https://github.com/Tracktion/pluginval/releases/download/v1.0.3/${asset}"
+          mkdir -p pv && (cd pv && unzip -q ../pv.zip)
+          exe=$(find pv -type f \( -name pluginval -o -name pluginval.exe \) | head -n 1)
           if [ -z "$exe" ]; then
-            echo "::error::AltDenoiserTests binary not found"
-            find build -name 'AltDenoiser*' -maxdepth 4 || true
-            exit 1
+            exe=$(find pv -type d -name 'pluginval.app' -prune -print | head -n 1)/Contents/MacOS/pluginval
           fi
-          echo "Harness: $exe"
+          chmod +x "$exe" || true
+          echo "PLUGINVAL=$PWD/$exe" >> "$GITHUB_ENV"
 
-          # JUCE initialises a MessageManager, which needs a display on Linux.
-          RUN=""
-          if [ "$RUNNER_OS" = "Linux" ]; then RUN="xvfb-run -a"; fi
-
-          # Cover the geometries that used to behave differently: a block size
-          # that is a multiple of the 480-sample model hop, one that is not, and
-          # rates that require real resampling in both directions.
-          for cfg in "480 48000" "512 48000" "1024 48000" "512 44100" "1024 96000"; do
-            echo "--- block/rate: $cfg ---"
-            $RUN "$exe" $cfg
-          done
+      # The SAME script developers run locally, so a green tick here and a green
+      # run on a workstation mean the same thing. It builds, runs the offline
+      # harness across five geometries, runs pluginval, and checks the packaging
+      # shape. It reports DEGRADED rather than clean if a stage is skipped.
+      - name: Verification gate
+        shell: bash
+        run: bash scripts/gate.sh build
 
       # Ship only the VST3 bundle. The build tree also contains a ~44 MB
       # _SharedCode.lib link intermediate and MSVC .exp/.lib stubs, which were
