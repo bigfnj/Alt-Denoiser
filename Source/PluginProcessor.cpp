@@ -83,7 +83,12 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
         outputFifo.push(primingSilence.data(), modelFrameLength);
     }
 
-    int latencyInHost = juce::roundToInt(1920.0 * (sampleRate / 48000.0));
+    // Report zero latency when the model could not be loaded. The bypass path
+    // (H7) passes audio through untouched, so asking the host to delay every
+    // other track by 40 ms for a plugin that is not processing is simply wrong.
+    const int latencyInHost = usable
+        ? juce::roundToInt(1920.0 * (sampleRate / 48000.0))
+        : 0;
     setLatencySamples(latencyInHost);
 
     // H2: initialize() builds a fresh DFState at a hardcoded 100 dB, but
@@ -244,7 +249,9 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
   if (modelAvailable) {
     float newAttenLim = *apvts.getRawParameterValue("atten_lim");
     if (std::abs(newAttenLim - lastAttenLim) > 0.01f) {
-        dfProcessor->setAttenLim(newAttenLim);
+        // H3 residue: published to the worker rather than applied here, because
+        // the worker is concurrently inside processFrame on the same DFState.
+        worker.setAttenuationLimit(newAttenLim);
         lastAttenLim = newAttenLim;
     }
 

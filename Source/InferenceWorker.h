@@ -129,6 +129,7 @@ public:
         framesAccepted.store (0, std::memory_order_relaxed);
         framesCollected.store (0, std::memory_order_relaxed);
         framesDroppedAfterAccept.store (0, std::memory_order_relaxed);
+        attenLimDirty.store (false, std::memory_order_relaxed);
 
         if (model != nullptr && size > 0)
         {
@@ -166,6 +167,26 @@ public:
         // actually takes 15.5 ms, which would exceed the entire cushion.
         wakeUp.signal();
         return accepted;
+    }
+
+    /** Audio thread. Publishes a new attenuation limit for the worker to apply.
+
+        H3 residue that survived M1. The audio thread used to call
+        DeepFilterNetProcessor::setAttenLim directly while this worker called
+        processFrame on the same DFState. df_set_atten_lim writes the limit that
+        process() reads, so both threads held aliasing mutable access to the
+        model. Routing it through here makes the worker the only thread that
+        touches libDF at all, which is what this class already claimed.
+
+        The limit is applied at a hop boundary, so a hop already queued is
+        processed with the previous value. That is a sub-hop difference and is
+        arguably the more correct behaviour.
+    */
+    void setAttenuationLimit (float db)
+    {
+        pendingAttenLim.store (db, std::memory_order_relaxed);
+        attenLimDirty.store (true, std::memory_order_release);
+        wakeUp.signal();
     }
 
     /** Audio thread. Retrieves one finished hop and the input sequence it came
@@ -242,6 +263,11 @@ private:
         {
             bool didWork = false;
 
+            // Applied here rather than from the audio thread, so this stays the
+            // only thread that ever calls into the model.
+            if (attenLimDirty.exchange (false, std::memory_order_acquire))
+                model->setAttenLim (pendingAttenLim.load (std::memory_order_relaxed));
+
             unsigned sequence = 0;
             while (inbound.pop (sequence, scratchIn.data()))
             {
@@ -289,6 +315,8 @@ private:
     std::atomic<unsigned> framesAccepted { 0 };
     std::atomic<unsigned> framesCollected { 0 };
     std::atomic<unsigned> framesDroppedAfterAccept { 0 };
+    std::atomic<float> pendingAttenLim { 100.0f };
+    std::atomic<bool>  attenLimDirty { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (InferenceWorker)
 };
