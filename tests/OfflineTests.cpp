@@ -929,6 +929,105 @@ void testStateSchema()
               + std::to_string (afterFuture) + " (want the 100 default)");
 }
 
+//==============================================================================
+// T19 / M8 - SimpleFifo, tested directly.
+//
+// Every one of these defects was unreachable through the plugin's call sites,
+// because the guards lived in the callers. That is exactly why the class needs
+// its own test: the next caller does not inherit those guards.
+
+void testSimpleFifo()
+{
+    std::vector<std::string> failures;
+    auto check = [&failures] (bool ok, const char* what)
+    {
+        if (! ok) failures.push_back (what);
+    };
+
+    const float ramp[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    float out[8] = {};
+
+    // An unsized FIFO must refuse everything rather than divide by zero. This is
+    // the crash a review probe hit through reset() after a refused prepare.
+    {
+        SimpleFifo f;
+        check (! f.push (ramp, 4),    "unsized push should be refused");
+        check (! f.pushSilence (4),   "unsized pushSilence should be refused");
+        check (! f.discard (1),       "unsized discard should be refused");
+        check (f.getAvailable() == 0, "unsized FIFO should report nothing available");
+    }
+
+    // Wrap-around must preserve order.
+    {
+        SimpleFifo f;
+        f.setSize (5);
+        check (f.push (ramp, 4), "push of 4 into 5 should succeed");
+        check (f.discard (3),    "discard of 3 should succeed");
+        check (f.push (ramp + 4, 3), "push of 3 after discard should succeed");   // wraps
+        check (f.getAvailable() == 4, "should hold 4 after wrap");
+        check (f.peek (out, 4), "peek of 4 should succeed");
+        check (out[0] == 4 && out[1] == 5 && out[2] == 6 && out[3] == 7,
+               "wrapped read should preserve order");
+    }
+
+    // Overflow must be refused, not silently clamped. The original advanced
+    // writePos past readPos while clamping the count, which left the FIFO
+    // reporting full and returning newest-then-oldest.
+    {
+        SimpleFifo f;
+        f.setSize (4);
+        check (f.push (ramp, 4), "fill to capacity should succeed");
+        check (! f.push (ramp, 1), "push beyond capacity should be refused");
+        check (f.getAvailable() == 4, "refused push must not change the count");
+        check (f.getOverflows() == 1, "refused push should be counted");
+        check (f.peek (out, 4) && out[0] == 1 && out[3] == 4,
+               "contents must survive a refused push intact");
+    }
+
+    // Under-run must be refused so the count can never go negative. A negative
+    // count was the input to the signed/unsigned comparison that clamped the
+    // FIFO to "full", so this is the assertion that pins the original bug.
+    {
+        SimpleFifo f;
+        f.setSize (4);
+        check (f.push (ramp, 2), "push of 2 should succeed");
+        check (! f.discard (3), "discard beyond available should be refused");
+        check (f.getAvailable() == 2, "refused discard must not change the count");
+        check (f.getUnderflows() == 1, "refused discard should be counted");
+
+        // The original would now report 4 (capacity) instead of 2. Pushing one
+        // sample and reading it back is what catches that.
+        check (f.push (ramp + 7, 1), "push after a refused discard should succeed");
+        check (f.getAvailable() == 3, "count should be 3, not the capacity");
+        check (f.peek (out, 3) && out[2] == 8, "the newly pushed sample should read back");
+    }
+
+    // Negative and null arguments must be refused rather than looped on.
+    {
+        SimpleFifo f;
+        f.setSize (4);
+        check (! f.push (ramp, -5),   "negative push should be refused");
+        check (! f.push (nullptr, 2), "null push should be refused");
+        check (! f.discard (-5),      "negative discard should be refused");
+        check (! f.peek (out, -1),    "negative peek should be refused");
+        check (f.getAvailable() == 0, "refusals must leave the FIFO empty");
+    }
+
+    // setSize(0) must leave it inert rather than armed with a zero modulus.
+    {
+        SimpleFifo f;
+        f.setSize (4);
+        f.setSize (0);
+        check (f.getCapacity() == 0, "setSize(0) should report zero capacity");
+        check (! f.push (ramp, 1),   "push into a zero-capacity FIFO should be refused");
+    }
+
+    std::string detail = failures.empty()
+        ? std::string ("all bounds, wrap-around, overflow, underflow and null cases behave")
+        : (std::to_string (failures.size()) + " failed: " + failures.front());
+    record ("SimpleFifo is bounds-safe", "M8", failures.empty(), Expect::Pass, detail);
+}
+
 } // namespace
 
 //==============================================================================
@@ -960,6 +1059,7 @@ int main (int argc, char** argv)
     testAttenuationIsACrossfade();
     testAttenuationMixIsSmoothedAndBounded();
     testStateSchema();
+    testSimpleFifo();
 
     int unexpected = 0;
     for (const auto& r : results)

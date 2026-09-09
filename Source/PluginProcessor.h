@@ -10,41 +10,91 @@
 #include <vector>
 #include <memory>
 
+/** Single-threaded ring buffer for sub-hop accumulation.
+
+    M8: every operation is now bounds-checked and reports refusal, and the class
+    caches its own capacity rather than consulting buffer.size().
+
+    The original had three ways to corrupt itself. `samplesInFifo > buffer.size()`
+    compared a signed int against a size_t, so the usual arithmetic conversions
+    turned any NEGATIVE count into a huge unsigned value, which compared greater
+    and clamped the FIFO to "completely full". `discard` had no floor, so it was
+    the thing that could produce that negative count. And every wrap used
+    `% buffer.size()`, which is a division by zero before setSize has run: a
+    review probe reached exactly that state through reset() after a refused
+    prepareToPlay and crashed with exit 139.
+
+    None of those were reachable through the call sites, which all guard
+    correctly, but the guards lived in the callers rather than the class. They
+    live here now, and the counters record whether they ever fired.
+*/
 class SimpleFifo {
 public:
-    void setSize(int size) { 
-        buffer.resize(size, 0.0f); 
-        writePos = 0; readPos = 0; samplesInFifo = 0; 
+    void setSize(int size) {
+        capacity = juce::jmax(0, size);
+        buffer.assign((size_t) capacity, 0.0f);
+        writePos = 0; readPos = 0; samplesInFifo = 0;
+        overflows = 0; underflows = 0;
     }
-    
-    void push(const float* data, int numSamples) {
-        // A default-constructed FIFO has an empty buffer, so `% buffer.size()`
-        // below is a division by zero and `buffer[writePos]` writes out of
-        // bounds. reset() could reach exactly that state after a refused
-        // prepareToPlay; a review probe crashed with exit 139.
-        if (buffer.empty() || numSamples <= 0) { jassertfalse; return; }
+
+    /** Returns false and stores nothing if the request does not fit. */
+    bool push(const float* data, int numSamples) {
+        if (capacity <= 0 || numSamples <= 0 || data == nullptr) { jassertfalse; return false; }
+        if (numSamples > getFreeSpace()) { jassertfalse; ++overflows; return false; }
+
         for (int i = 0; i < numSamples; ++i) {
-            buffer[writePos] = data[i];
-            writePos = (writePos + 1) % buffer.size();
+            buffer[(size_t) writePos] = data[i];
+            if (++writePos == capacity) writePos = 0;
         }
         samplesInFifo += numSamples;
-        if (samplesInFifo > buffer.size()) samplesInFifo = buffer.size();
+        return true;
     }
-    
-    void peek(float* dest, int numSamples) {
+
+    /** Pushes numSamples of silence. Used by the three priming sites. */
+    bool pushSilence(int numSamples) {
+        if (capacity <= 0 || numSamples <= 0) { jassertfalse; return false; }
+        if (numSamples > getFreeSpace()) { jassertfalse; ++overflows; return false; }
+
+        for (int i = 0; i < numSamples; ++i) {
+            buffer[(size_t) writePos] = 0.0f;
+            if (++writePos == capacity) writePos = 0;
+        }
+        samplesInFifo += numSamples;
+        return true;
+    }
+
+    /** Returns false and writes nothing if fewer than numSamples are available. */
+    bool peek(float* dest, int numSamples) const {
+        if (capacity <= 0 || numSamples <= 0 || dest == nullptr) { jassertfalse; return false; }
+        if (numSamples > samplesInFifo) { jassertfalse; return false; }
+
         int tempRead = readPos;
         for (int i = 0; i < numSamples; ++i) {
-            dest[i] = buffer[tempRead];
-            tempRead = (tempRead + 1) % buffer.size();
+            dest[i] = buffer[(size_t) tempRead];
+            if (++tempRead == capacity) tempRead = 0;
         }
+        return true;
     }
-    
-    void discard(int numSamples) {
-        readPos = (readPos + numSamples) % buffer.size();
+
+    /** Returns false and advances nothing if fewer than numSamples are available,
+        so the count can never go negative.
+    */
+    bool discard(int numSamples) {
+        if (capacity <= 0 || numSamples <= 0) { jassertfalse; return false; }
+        if (numSamples > samplesInFifo) { jassertfalse; ++underflows; return false; }
+
+        readPos = (readPos + numSamples) % capacity;
         samplesInFifo -= numSamples;
+        return true;
     }
-    
-    int getAvailable() const { return samplesInFifo; }
+
+    int getAvailable() const noexcept { return samplesInFifo; }
+    int getCapacity()  const noexcept { return capacity; }
+    int getFreeSpace() const noexcept { return capacity - samplesInFifo; }
+
+    // Diagnostics: non-zero means a caller's own guard failed.
+    int getOverflows()  const noexcept { return overflows; }
+    int getUnderflows() const noexcept { return underflows; }
 
     void clear() {
         std::fill(buffer.begin(), buffer.end(), 0.0f);
@@ -53,9 +103,12 @@ public:
 
 private:
     std::vector<float> buffer;
+    int capacity = 0;
     int writePos = 0;
     int readPos = 0;
     int samplesInFifo = 0;
+    int overflows = 0;
+    int underflows = 0;
 };
 
 class AltDenoiserProcessor : public juce::AudioProcessor {
@@ -231,6 +284,7 @@ private:
     // not notice; emitting digital silence is a click they always will.
     SimpleFifo dryDelay;
     std::vector<float> dryScratch;
+    int primedDryDelay = 0;   // what prepareToPlay primed, so reset() matches it
 
     // M1: monotonic hop counter, and the barrier below which collected output is
     // discarded. Both are touched only by the audio thread and reset().

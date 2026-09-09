@@ -111,10 +111,7 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // This is also what the existing 1920 figure already assumed: 1440 samples
     // of model algorithmic delay ((960-480) + 2*480) plus 480 of cushion. The
     // number was right; the priming that would have made it true was missing.
-    {
-        const std::vector<float> primingSilence((size_t) modelFrameLength, 0.0f);
-        outputFifo.push(primingSilence.data(), modelFrameLength);
-    }
+    outputFifo.pushSilence(modelFrameLength);
 
     // Report zero latency when the model could not be loaded. The bypass path
     // (H7) passes audio through untouched, so asking the host to delay every
@@ -153,10 +150,8 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // fallback splice stays phase-aligned with the wet signal.
     const int dryDelaySamples = (int) std::lround(1920.0);
     dryDelay.setSize(48000);
-    {
-        const std::vector<float> primingSilence((size_t) dryDelaySamples, 0.0f);
-        dryDelay.push(primingSilence.data(), dryDelaySamples);
-    }
+    dryDelay.pushSilence(dryDelaySamples);
+    primedDryDelay = dryDelaySamples;   // so reset() re-primes the same amount
     dryScratch.assign((size_t) (maxResampledSize + modelFrameLength), 0.0f);
 
     // M1: hand the model to the worker. It becomes the sole owner, so nothing
@@ -213,19 +208,19 @@ void AltDenoiserProcessor::reset() {
     // The dry delay holds a full reported-latency window of pre-locate audio.
     // Leaving it would replay that content through the fallback path: measured
     // 4631 leaked samples before this line existed.
+    // M8: pushSilence instead of allocating a vector. reset() may be called on
+    // the audio thread by some hosts, and this path allocated twice per call.
+    // The amount comes from what prepareToPlay actually primed rather than a
+    // second copy of the 1920 literal, which could drift out of step with it.
     dryDelay.clear();
-    if (dryDelay.getAvailable() == 0) {
-        const std::vector<float> primingSilence((size_t) 1920, 0.0f);
-        dryDelay.push(primingSilence.data(), 1920);
-    }
+    dryDelay.pushSilence(primedDryDelay);
 
     if (modelFrameLength <= 0)
         return;
 
     // Restore the H5/H6 priming cushion so the first block after the locate does
     // not underrun and splice in silence.
-    const std::vector<float> primingSilence((size_t) modelFrameLength, 0.0f);
-    outputFifo.push(primingSilence.data(), modelFrameLength);
+    outputFifo.pushSilence(modelFrameLength);
 
     // The model's own state is deliberately NOT reset. libDF exposes no reset
     // entry point, and df_free plus df_create would re-read and re-parse the
