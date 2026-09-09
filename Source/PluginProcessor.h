@@ -131,6 +131,20 @@ public:
     // the FIFOs and was replayed at the new position.
     void reset() override;
 
+    /** M7: a real bypass parameter, so no wrapper ever synthesises one.
+
+        JUCE's default processBlockBypassed is a bare passthrough carrying
+        `jassert (getLatencySamples() == 0)`. This plugin reports 1920, so the
+        default would land a bypassed track 40 ms EARLY against the host's
+        compensation and break on the assertion in a Debug build.
+
+        Declaring the parameter also means APVTS saves it. A wrapper-synthesised
+        bypass is stored in VST3's private state and not stored at all by AU or
+        LV2, so it would not survive a session reload on two of three formats.
+    */
+    juce::AudioParameterBool* getBypassParameter() const override { return bypassParam; }
+    void processBlockBypassed(juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
     const juce::String getName() const override { return "Alt Denoiser"; }
@@ -285,6 +299,17 @@ private:
     SimpleFifo dryDelay;
     std::vector<float> dryScratch;
     int primedDryDelay = 0;   // what prepareToPlay primed, so reset() matches it
+
+    // M7: the bypass path needs the ORIGINAL input, per channel, at HOST rate,
+    // delayed by exactly the reported latency. dryDelay cannot serve: it is mono
+    // and lives in the 48 kHz domain, so bypassing through it would collapse the
+    // channels and pass the signal through the resampler twice.
+    juce::AudioParameterBool* bypassParam = nullptr;
+    std::vector<SimpleFifo> bypassDelay;
+    std::vector<float> bypassScratch;
+    juce::SmoothedValue<float> bypassMix;          // 0 = processed, 1 = bypassed
+    static constexpr double kBypassRampSeconds = 0.01;
+    bool forcedBypass = false;                     // set by processBlockBypassed
 
     // M1: monotonic hop counter, and the barrier below which collected output is
     // discarded. Both are touched only by the audio thread and reset().

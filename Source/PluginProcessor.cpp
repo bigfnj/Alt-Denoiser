@@ -14,6 +14,9 @@ AltDenoiserProcessor::AltDenoiserProcessor()
     // thread every single block.
     attenParam = apvts.getRawParameterValue("atten_lim");
     jassert(attenParam != nullptr);
+
+    bypassParam = dynamic_cast<juce::AudioParameterBool*>(apvts.getParameter("bypass"));
+    jassert(bypassParam != nullptr);
 }
 
 AltDenoiserProcessor::~AltDenoiserProcessor() {
@@ -40,6 +43,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout AltDenoiserProcessor::create
                                        : juce::String(value, 1) + " dB";
             })
     ));
+
+    // M7: added last. VST3 hashes parameter IDs from the string plus version
+    // hint rather than from index, so appending one does not renumber atten_lim
+    // and existing automation survives.
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        juce::ParameterID { "bypass", 1 }, "Bypass", false));
 
     return layout;
 }
@@ -129,6 +138,22 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // H2 was that a fresh model reverted to its hardcoded 100 dB while the UI
     // still showed the user's setting. The model is now always at 100 and the
     // limit lives entirely on this side, so the failure has no mechanism left.
+    // M7: one delay line per channel, primed with the reported latency so a
+    // bypassed track stays aligned with the host's compensation.
+    {
+        const int channels = juce::jmax(1, getTotalNumInputChannels());
+        bypassDelay.clear();
+        bypassDelay.resize((size_t) channels);
+        for (auto& d : bypassDelay) {
+            d.setSize(latencyInHost + samplesPerBlock + 1);
+            d.pushSilence(latencyInHost);
+        }
+        bypassScratch.assign((size_t) samplesPerBlock, 0.0f);
+    }
+    bypassMix.reset(sampleRate, kBypassRampSeconds);
+    bypassMix.setCurrentAndTargetValue(
+        (bypassParam != nullptr && bypassParam->get()) ? 1.0f : 0.0f);
+
     attenMix.reset(sampleRate, kAttenRampSeconds);
     attenMix.setCurrentAndTargetValue(attenLimitToDryMix(attenParam->load(std::memory_order_relaxed)));
 
@@ -191,6 +216,21 @@ void AltDenoiserProcessor::releaseResources() {
     modelLoaded.store(false, std::memory_order_release);
 }
 
+void AltDenoiserProcessor::processBlockBypassed(juce::AudioBuffer<float>& buffer,
+                                                juce::MidiBuffer& midi) {
+    // M7: the base implementation is a bare passthrough that asserts the plugin
+    // reports zero latency. This one reports 1920, so the default would land a
+    // bypassed track 40 ms early against the host's compensation and break on
+    // the assertion in a Debug build.
+    //
+    // Routing through processBlock instead means the bypassed signal takes the
+    // same latency-aligned path as the parameter-driven bypass, so a host that
+    // engages bypass through either route gets identical, aligned audio.
+    forcedBypass = true;
+    processBlock(buffer, midi);
+    forcedBypass = false;
+}
+
 void AltDenoiserProcessor::reset() {
     // M2: a transport locate calls reset() without re-preparing, so anything
     // still buffered here would be replayed at the new playhead position. Clear
@@ -214,6 +254,13 @@ void AltDenoiserProcessor::reset() {
     // second copy of the 1920 literal, which could drift out of step with it.
     dryDelay.clear();
     dryDelay.pushSilence(primedDryDelay);
+
+    // M7: the bypass delays hold a full latency window of pre-locate audio too.
+    for (auto& d : bypassDelay) {
+        const int primed = juce::jmax(0, getLatencySamples());
+        d.clear();
+        d.pushSilence(primed);
+    }
 
     if (modelFrameLength <= 0)
         return;
@@ -252,6 +299,14 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // making a silent plugin look healthy.
     const bool modelAvailable = modelLoaded.load(std::memory_order_acquire)
                                 && dfProcessor != nullptr && dfProcessor->isReady();
+
+    // M7: capture the untouched input FIRST. Everything below works in place,
+    // so this is the only point at which the dry signal still exists.
+    {
+        const int n = buffer.getNumSamples();
+        for (int ch = 0; ch < totalNumInputChannels && ch < (int) bypassDelay.size(); ++ch)
+            bypassDelay[(size_t) ch].push(buffer.getReadPointer(ch), n);
+    }
 
     // M10/L4: sample peak across ALL input channels, held until the editor
     // consumes it. AudioBuffer::getMagnitude(start, num) scans every channel, so
@@ -415,6 +470,37 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     for (int ch = 0; ch < totalNumOutputChannels; ++ch)
         juce::FloatVectorOperations::copy(buffer.getWritePointer(ch), monoBuffer.data(), hostNumSamples);
   }   // if (modelAvailable); otherwise the buffer passes through untouched
+
+    // M7: crossfade to the latency-aligned dry signal.
+    //
+    // The model keeps running while bypassed. That is deliberate: it is the only
+    // way un-bypassing cannot flush stale audio or re-trigger the H5 startup
+    // splice, because nothing is ever flushed and the FIFOs never leave their
+    // target fill. The cost is that bypass saves no CPU.
+    {
+        const int n = buffer.getNumSamples();
+        const bool wantBypass = forcedBypass
+                             || (bypassParam != nullptr && bypassParam->get());
+        bypassMix.setTargetValue(wantBypass ? 1.0f : 0.0f);
+
+        for (int ch = 0; ch < totalNumOutputChannels && ch < (int) bypassDelay.size(); ++ch) {
+            auto& delay = bypassDelay[(size_t) ch];
+            if (! delay.peek(bypassScratch.data(), n))
+                continue;
+
+            // Each channel walks its own copy of the smoother so they ramp
+            // identically; the master advances once, below.
+            auto chMix = bypassMix;
+            auto* w = buffer.getWritePointer(ch);
+            for (int i = 0; i < n; ++i) {
+                const float m = chMix.getNextValue();
+                w[i] += m * (bypassScratch[(size_t) i] - w[i]);
+            }
+        }
+        bypassMix.skip(n);
+        for (auto& d : bypassDelay)
+            d.discard(n);
+    }
 
     // Measured after processing (or after the H7 bypass), so the meter reflects
     // what actually leaves the plugin.

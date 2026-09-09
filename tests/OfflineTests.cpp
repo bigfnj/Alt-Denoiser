@@ -1028,6 +1028,141 @@ void testSimpleFifo()
     record ("SimpleFifo is bounds-safe", "M8", failures.empty(), Expect::Pass, detail);
 }
 
+//==============================================================================
+// T20 / M7 - bypass must be latency-aligned, exposed, and click-free.
+
+void setBypass (AltDenoiserProcessor& proc, bool on)
+{
+    auto* p = proc.apvts.getParameter ("bypass");
+    jassert (p != nullptr);
+    p->setValueNotifyingHost (on ? 1.0f : 0.0f);
+}
+
+void testBypassIsLatencyAligned()
+{
+    AltDenoiserProcessor proc;
+    prepare (proc);
+    setBypass (proc, true);
+
+    const int latency = proc.getLatencySamples();
+    std::vector<float> in, out;
+    render (proc, 60,
+            [&in] (juce::AudioBuffer<float>& b, int blk)
+            {
+                fillSine (b, blk, 440.0f, 880.0f);
+                const auto* p = b.getReadPointer (0);
+                in.insert (in.end(), p, p + b.getNumSamples());
+            },
+            [&out] (const juce::AudioBuffer<float>& b, int)
+            {
+                const auto* p = b.getReadPointer (0);
+                out.insert (out.end(), p, p + b.getNumSamples());
+            });
+
+    // Bypassed, the output must be the input delayed by EXACTLY the reported
+    // latency, bit-for-bit: the bypass path is a delay line, not a resampler, so
+    // unlike the L6 crossfade there is no interpolation error to allow for.
+    double worst = 0.0;
+    const int from = latency + 2000;
+    const int to = (int) std::min (out.size(), in.size() + (size_t) latency) - 1;
+    for (int i = from; i < to; ++i)
+        worst = std::max (worst, (double) std::abs (out[(size_t) i] - in[(size_t) (i - latency)]));
+
+    const bool passed = (to > from) && (worst < 1.0e-6);
+    record ("bypass is latency-aligned", "M7", passed, Expect::Pass,
+            "reported latency " + std::to_string (latency)
+              + ", worst |out[n+latency] - in[n]| = " + std::to_string (worst)
+              + " over " + std::to_string (to - from) + " samples (want bit-exact)");
+}
+
+void testBypassPreservesStereo()
+{
+    // The processed path is mono by design (H4). Bypass must NOT be: it is a
+    // per-channel delay line, so a bypassed stereo track has to stay stereo.
+    AltDenoiserProcessor proc;
+    prepare (proc);
+    setBypass (proc, true);
+
+    double maxDiff = 0.0;
+    render (proc, 40,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 880.0f); },
+            [&maxDiff] (const juce::AudioBuffer<float>& b, int blk)
+            {
+                if (blk < 20) return;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    maxDiff = std::max (maxDiff, (double) std::abs (b.getSample (0, i) - b.getSample (1, i)));
+            });
+
+    const bool passed = (maxDiff > 0.1);
+    record ("bypass preserves stereo", "M7", passed, Expect::Pass,
+            "max |L-R| bypassed = " + std::to_string (maxDiff)
+              + " (0 would mean bypass collapsed the channels like the wet path does)");
+}
+
+void testBypassToggleDoesNotClick()
+{
+    AltDenoiserProcessor proc;
+    prepare (proc);
+    setBypass (proc, false);
+
+    // ONE render, toggling inside it. Two separate render calls would restart
+    // fillSine's block index, putting a phase jump in the INPUT and making the
+    // test fail on a discontinuity it created itself. That is what the first
+    // version of this test did, reporting steps of 0.25 against a 0.25 signal.
+    std::vector<float> out;
+    render (proc, 150,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [&out, &proc] (const juce::AudioBuffer<float>& b, int blk)
+            {
+                const auto* p = b.getReadPointer (0);
+                out.insert (out.end(), p, p + b.getNumSamples());
+                if (blk == 90) setBypass (proc, true);
+            });
+
+    // Two things a bad bypass produces: a silent gap where stale audio was
+    // flushed, and a step discontinuity at the switch. Neither is allowed.
+    const int latency = proc.getLatencySamples();
+    const int worstRun = longestZeroRun (out, latency);
+
+    double worstStep = 0.0;
+    for (size_t i = (size_t) latency + 1; i < out.size(); ++i)
+        worstStep = std::max (worstStep, (double) std::abs (out[i] - out[i - 1]));
+
+    // A 440 Hz sine at 0.25 peak steps at most 0.25*2*pi*440/rate per sample,
+    // about 0.009 at 48 kHz. Allow generous headroom for the crossfade itself
+    // but nothing like a full-scale jump.
+    const double stepLimit = 0.05;
+    const bool passed = (worstRun <= 4) && (worstStep < stepLimit);
+    record ("bypass toggle does not click", "M7", passed, Expect::Pass,
+            "longest zero run " + std::to_string (worstRun)
+              + ", worst sample-to-sample step " + std::to_string (worstStep)
+              + " (limit " + std::to_string (stepLimit) + ")");
+}
+
+void testBypassParameterIsExposedAndSaved()
+{
+    AltDenoiserProcessor proc;
+
+    const bool exposed = (proc.getBypassParameter() != nullptr);
+
+    // It must be a real parameter, not a wrapper-synthesised one, so it survives
+    // a state round-trip. A synthesised bypass is stored in VST3's private state
+    // and not stored at all by AU or LV2.
+    setBypass (proc, true);
+    juce::MemoryBlock saved;
+    proc.getStateInformation (saved);
+
+    AltDenoiserProcessor fresh;
+    fresh.setStateInformation (saved.getData(), (int) saved.getSize());
+    const auto* p = fresh.getBypassParameter();
+    const bool restored = (p != nullptr) && p->get();
+
+    const bool passed = exposed && restored;
+    record ("bypass parameter is exposed and saved", "M7", passed, Expect::Pass,
+            std::string ("getBypassParameter() ") + (exposed ? "non-null" : "NULL")
+              + ", survived a state round-trip: " + (restored ? "yes" : "no"));
+}
+
 } // namespace
 
 //==============================================================================
@@ -1060,6 +1195,10 @@ int main (int argc, char** argv)
     testAttenuationMixIsSmoothedAndBounded();
     testStateSchema();
     testSimpleFifo();
+    testBypassIsLatencyAligned();
+    testBypassPreservesStereo();
+    testBypassToggleDoesNotClick();
+    testBypassParameterIsExposedAndSaved();
 
     int unexpected = 0;
     for (const auto& r : results)
