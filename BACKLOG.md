@@ -9,7 +9,7 @@ deviate, so nothing here is being sent upstream.
 
 ## Status, 2026-09-09
 
-All 30 original findings are closed. Verified by `scripts/gate.sh`: a build, the offline
+All 33 original findings are closed: C1-C5, H1-H7, M1-M13, L1-L8. Earlier revisions of this file said 30, which never matched the list. Verified by `scripts/gate.sh`: a build, the offline
 harness across five geometries (480/48000, 512/48000, 1024/48000, 512/44100, 1024/96000),
 `pluginval` at strictness 5, and a packaging shape check, run identically locally and in CI on
 Windows, macOS and Linux.
@@ -340,7 +340,7 @@ latency.
 | L3 | `PluginEditor.h:64-68` | **FIXED** (`8135ca5`); clamped at the -100 dB floor. Was: `displayedDb` has no lower clamp and decrements without bound, reaching about -108,000 after an hour. Masked only because the readout prints "-inf" below -90. |
 | L4 | `PluginProcessor.cpp:74`, `:131` | **FIXED** (`8135ca5`); sample peak across all channels. Was: RMS values are drawn on a scale styled for peaks, with a red band above 0 dB that cannot light: a full-scale sine is -3.01 dB RMS. Only channel 0 is metered, so a right-channel-only source reads as silence on the input meter. |
 | L5 | `PluginProcessor.cpp:81` | **FIXED** (`58e120d`); pointer cached in the constructor. Was: String-keyed parameter lookup on the audio thread every block, rather than caching the `std::atomic<float>*` once in the constructor. |
-| L6 | `PluginProcessor.cpp:82-85` | **ATTEMPTED AND REVERTED** (`58e120d`). A hop-rate slew in the worker failed the gate at hop-aligned block sizes, varied 3.5x-100x with buffer size, and reintroduced H2. See the commit. The correct shape is an audio-thread crossfade: `atten_lim` is implemented in tract.rs as `(1-lim)*wet + lim*dry`, and the plugin already holds the aligned dry signal. Was: Attenuation changes are applied per block with no smoothing, so a fast automation ramp steps audibly. |
+| L6 | `PluginProcessor.cpp:541-547` | **FIXED** (`1f495d3`) as an audio-thread crossfade, pinned by two harness tests. The first attempt was **ATTEMPTED AND REVERTED** (`58e120d`). A hop-rate slew in the worker failed the gate at hop-aligned block sizes, varied 3.5x-100x with buffer size, and reintroduced H2. See the commit. The correct shape is an audio-thread crossfade: `atten_lim` is implemented in tract.rs as `(1-lim)*wet + lim*dry`, and the plugin already holds the aligned dry signal. Was: Attenuation changes are applied per block with no smoothing, so a fast automation ramp steps audibly. |
 | L7 | `PluginProcessor.h:70-88` | **FIXED** (`58e120d`); schemaVersion added. The unreachable createXml() null check was deliberately NOT added. Was: `setStateInformation` checks only the tag name, with no schema version, and `*xml` is dereferenced without checking `createXml()` for null. |
 | L8 | `PluginProcessor.h:19`, `:29`, `:34`, `PluginProcessor.cpp:50` | **FIXED** (`58e120d`); geometry refused before anything is built from it, plus SimpleFifo hardened against an unsized buffer. Was: No guard against `sampleRate == 0` or `processBlock` preceding `prepareToPlay`; a scanner calling `prepareToPlay(0, 0)` yields an infinite ratio and an unbounded resampler write loop. |
 
@@ -530,7 +530,7 @@ improvement on the current claim, at the cost of a 29 MB larger binary.
 
 ### LIC1. No licence file, and the stated licence is wrong for the pinned JUCE
 
-**FIXED** (`this commit`). Canonical AGPLv3 text added as `LICENSE` (661 lines, SHA-256
+**FIXED** (`b169d88`). Canonical AGPLv3 text added as `LICENSE` (661 lines, SHA-256
 `0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0`, includes section 13 Remote
 Network Interaction). README badge and licence section corrected, component licences tabulated,
 and an AGPLv3 section 5(a) modification notice added. The release workflow now copies `LICENSE`
@@ -675,6 +675,90 @@ the model. Roughly the coverage the comparable Rust project gets from its 28 tes
   corrected.
 - ~~The library's licence and its compatibility with LIC1.~~ **CC0 1.0 Universal** (public
   domain dedication), so compatible with anything, including AGPLv3.
+
+---
+
+## Post-merge audit, 2026-09-09
+
+A four-domain audit of `094fe39` after everything above was on `main`: memory and threading,
+test quality, dead code and regressions, optimisation. Fixed in `6f353d1` unless marked OPEN.
+
+### Defects found and fixed
+
+| ID | Finding |
+| :--- | :--- |
+| A1 | The attenuation ramp was not sample-rate independent, and its comment claimed it was. `attenMix` was primed with the host rate while `getNextValue()` is called once per 48 kHz sample, so the ramp ran 100 ms at 96 kHz against an intended 50 ms. |
+| A2 | The bypass delay desynchronised permanently after one oversized block. `processBlock` pushed into `bypassDelay` before the C5 guard and discarded after it, so a refused block was pushed and never drained. Silent: the push SUCCEEDED, so not even the overflow counter moved. |
+| A3 | `reset()` after a refused prepare called `pushSilence(0)`, which `SimpleFifo` refuses with `jassertfalse`, breaking Debug builds on a path the harness drives. |
+| A4 | `getInFlight()` could read negative, because `framesAccepted` was incremented after `inbound.push`. That exited the offline drain loop early and spliced an unnecessary dry frame. |
+| A5 | `worker.submit()` took a mutex on the audio thread once per hop. `juce::WaitableEvent` is not an OS event in JUCE 8 on any platform; `signal()` locks a `std::mutex` and calls `notify_all()` under it. No priority inheritance bounds a stall if the worker is preempted mid-hold. It now signals only when the worker publishes that it is waiting. |
+| A6 | Inference failures were invisible. `processFrame` returns `bool`, the worker discarded it, and the counter behind it had no reader, so a model failing every frame produced dry audio with nothing to show for it. `fallbackSamples` stays 0 in that case, because a frame WAS delivered. |
+| A7 | Teardown depended on member declaration order. Reordering `worker` and `dfProcessor` would give a use-after-free at host shutdown. |
+| A8 | `alt_df_status_str` matched a `repr(C)` enum received from C exhaustively, which is only sound for a discriminant the enum declares. It takes an `int` with a default arm now. |
+| A9 | The CI cache still pointed at `modules/DeepFilterNet/target`, which nothing has built into since the shim. Every run since Phase 6 recompiled tract from scratch, taking run times from about 11 to about 17 minutes. |
+
+### The test audit's central finding
+
+At attenuation 0 the L6 crossfade computes `writePtr[i] += 1.0 * (dry[i] - writePtr[i])`,
+which erases the wet path arithmetically. Eleven tests ran there, so they asserted things
+about a plain delay line and nothing else.
+
+Measured: the M1 fallback test passed with the dry splice replaced by `zeromem`, and the H5
+test passed with the output FIFO priming deleted. Each was the only regression cover for its
+item. Both now run at attenuation 100, and the M1 test asserts `fallbackSamples > 0` rather
+than printing it. The mutation that was previously invisible now produces 39040 zeros
+against 4.
+
+This is the same trap 7a hit from the other direction: a test whose expected value comes from
+the code path under test. Worth stating as a rule for this repo. **Any assertion made at
+attenuation 0 is an assertion about `dryDelay` and nothing else.**
+
+### Still open, ranked
+
+| ID | Item | Measurement | Recommendation |
+| :--- | :--- | :--- | :--- |
+| A10 | JUCE is compiled TWICE per build. `AltDenoiserPlugin.dir` and `AltDenoiserTests.dir` each hold their own `juce_gui_basics.obj` (23.78 MB), `juce_graphics.obj` (14.44 MB) and 18 more. `juce_add_console_app` makes an independent JUCE target rather than reusing the plugin's shared code. | About half the C++ compile time, on all three CI platforms, on every clean build | DO IT. The largest single build-time win. |
+| A11 | The cargo cache key omits the toolchain. `dtolnay/rust-toolchain@stable` moves, every fingerprint then misses, and nothing prunes the 1.5 GB target directory. It also holds `df.lib` at 209 MB and `df.dll`, both built and discarded, because libDF declares `crate-type = ["cdylib", "rlib", "staticlib"]` and the shim links only the rlib. | 209 MB of dead staticlib per cache | DO IT. `Swatinem/rust-cache@v2` keys on the toolchain and prunes. |
+| A12 | The resampler has no ratio-1 short circuit. At 48 kHz it runs 960 spline evaluations and 960 double divisions per hop to produce a near-identity filter that is not bit-exact and adds about one sample of unreported delay. | ~12.8 us of ~17 us non-model audio-thread cost, plus a bit-exact 48 kHz path | WORTH TRYING. The CPU win is negligible against a 907 us model call; the bit-exactness is the real prize. |
+| A13 | `BinaryData` is compiled from 159.8 MB of generated C++ (`BinaryData2.cpp` alone is 131 MB), producing a 44.35 MB `.lib` via `/bigobj`. A linker resource would take the bytes verbatim. | 159.8 MB of parse work per clean build | WORTH TRYING. Three platforms, three mechanisms, so not a one-liner. |
+| A14 | `lto = "fat"` plus `codegen-units = 1` on the shim, and `opt-level = "z"` on `tract-onnx`, `tract-hir`, `tract-onnx-opl` and `tract-pulse`, which total about 1.46 MB and run only inside `alt_df_create`. | 0.8 to 1.6 MB combined, unmeasured | WORTH TRYING, measure before keeping. |
+| A15 | `stopThread(2000)` calls `TerminateThread` on timeout and its return value is discarded, so `prepareToPlay` proceeds to free a model the killed thread may be inside. Needs a worker stalled for over 2 s. | Low probability, host hang if the killed thread held the CRT heap lock | WORTH FIXING. Check the return and refuse to re-initialise. |
+| A16 | No ASAN or TSan job. N2 was found by reasoning and confirmed by a 1-in-6 `STATUS_HEAP_CORRUPTION`, which is not a detector. | | WORTH TRYING. A sanitiser build of the harness on Linux. |
+| A17 | Nothing measures denoising. No test asserts noise reduction, SNR improvement or a noise-floor drop. A model returning plausible-but-wrong audio at the right latency passes all 35 tests. The per-frame local SNR is computed by the shim and discarded. | | The most valuable gap in the suite. Feed speech plus known noise, assert the floor drops. |
+| A18 | `attenLimitToDryMix`'s interpolating arm is never exercised. Every test uses 0 or 100, and the parameter's useful range is everything between. | | Cheap test. |
+| A19 | Mono operation is never exercised. `render()` always builds two channels and `prepare()` always declares 2-in/2-out, though `isBusesLayoutSupported` advertises mono as supported. | | Cheap test. |
+| A20 | `processBlockBypassed` is never called by any test; all four bypass tests go through the parameter. `releaseResources()` is never called either. | | Cheap test. |
+| A21 | The editor hardcodes "40 ms"/"9%" and "20 ms"/"27%" as strings. 7a exists so the latency is derived from the model; the UI re-hardcodes it. An archive with different geometry would make the UI lie while `getLatencySamples()` stayed correct. | | Derive the latency half. The CPU half has to stay a measured constant. |
+| A22 | `ALTDENOISER_MODELS=standard` takes the VST3 from 64,290,304 to 27,930,624 bytes. Measured from three builds of the same tree. | 36,359,680 bytes, 56.6% | Owner's call. This is 75x the best compressor result, and larger than every other size item on this list combined. |
+
+### Measured, and deliberately NOT done
+
+- Byte-plane shuffling the model weights before compression saves about 3.32 MB (5.2%),
+  measured on the real tar streams. It forks the archive format away from upstream and adds a
+  failure mode to the load path that C1 and C2 were about.
+- A stronger compressor (brotli -q11) saves 486,387 bytes, 0.76%, and a third of that goes
+  straight back into the decoder it needs.
+- `panic = "abort"` would remove 2,241,372 bytes of Rust unwind tables, 3.5% of the file. It
+  also removes the C1/C2 guarantee, which is why `lib.rs` carries a `compile_error!` on it.
+- Aggressive `/OPT:ICF` saves 68,865 bytes and breaks function-pointer identity.
+- Dropping unused JUCE modules for SIZE saves exactly zero. `/OPT:REF` already deleted all of
+  it: no FLAC, Ogg, vorbis, WAVE, AIFF, ASIO or WASAPI literal survives anywhere in the DLL.
+  It is still worth doing for build time.
+- Shrinking the 480-sample cushion. The quantisation arithmetic does allow 0 at a
+  480-multiple block size at 48 kHz, which is what LAT1 observed. It stopped being available
+  at M1: the audio thread calls `collect()` microseconds after `submit()` in the same
+  callback, so the worker is exactly one hop behind in steady state and the cushion is its
+  runway rather than a safety margin. A single short block would also move the residue off
+  zero permanently.
+
+### Where the binary actually goes
+
+PE section sizes sum to the byte. Non-model total 19,947,508, of which Rust is 16,424,126
+(82.3%) and C++ 3,465,631 (17.4%). Within the Rust half, attributed by the crate each
+function's panic location names: ndarray 32.0%, tract-core 28.7%, tract-data 7.9%, rustfft
+6.5%, tract-onnx 5.0%, tract-hir 4.0%, smallvec 3.7%, std 3.7%, tract-linalg 1.7%, libDF
+0.9%, the shim under 0.05%. This agrees with SIZE1's earlier estimate, which was reached by
+building a bare `main()`, so treat it as confirmed rather than new.
 
 ---
 
