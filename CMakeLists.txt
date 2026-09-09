@@ -103,11 +103,15 @@ add_subdirectory(${JUCE_DIR})
 # binary data
 #
 # 7b: which archives get embedded is a build option, because the low-latency one
-# is not a small addition. Measured uncompressed: standard 8.59 MB against
-# low-latency 39.0 MB, and the ONNX graphs behind them are 256 vs 512
-# emb_hidden_dim and 2 vs 3 df_num_layers. "Low latency" names its 960-sample
-# algorithmic delay against the standard model's 1920; it is the BIGGER and
-# SLOWER network, which is the opposite of what the name suggests.
+# is not a small addition. What lands in the binary is the compressed archive:
+# 7.98 MB for the standard model against 36.36 MB for the low-latency one, which
+# takes the Windows VST3 from 27.9 MB to 64.3 MB. (Uncompressed, the ONNX graphs
+# behind them are 8.59 MB and 39.0 MB.)
+#
+# "Low latency" names its 960-sample algorithmic delay against the standard
+# model's 1920. It is the BIGGER and SLOWER network, 512 against 256
+# emb_hidden_dim and 3 against 2 df_num_layers, which is the opposite of what the
+# name suggests.
 #
 # Both by default, so the plugin can show the trade-off rather than describe it.
 set(ALTDENOISER_MODELS "both" CACHE STRING

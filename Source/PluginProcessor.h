@@ -306,6 +306,12 @@ private:
     // not notice; emitting digital silence is a click they always will.
     SimpleFifo dryDelay;
     std::vector<float> dryScratch;
+    /** Capacity of every 48 kHz-domain FIFO: one second, which bounds any host
+        block plus the priming cushion for every geometry a real host uses. See
+        the jassert in prepareToPlay for the relationship it has to satisfy.
+    */
+    static constexpr int kFifoCapacity = 48000;
+
     int primedDryDelay = 0;   // what prepareToPlay primed, so reset() matches it
 
     // 7a: reported latency in the 48 kHz domain, derived from the loaded model's

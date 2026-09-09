@@ -149,7 +149,6 @@ public:
         model = nullptr;
     }
 
-    bool isActive() const { return isThreadRunning(); }
 
     /** Audio thread. Hands one hop to the worker and wakes it. */
     bool submit (unsigned sequence, const float* frame)
@@ -231,8 +230,6 @@ public:
         }
     }
 
-    int getPendingInput()  const { return inbound.getNumReady(); }
-    int getReadyOutput()   const { return outbound.getNumReady(); }
     int getDroppedFrames() const { return (int) droppedFrames.load (std::memory_order_relaxed); }
 
 private:

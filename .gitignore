@@ -1,4 +1,3 @@
-libs/libDF/*
 modules/*/target/
 libs/alt_df/target/
 build/

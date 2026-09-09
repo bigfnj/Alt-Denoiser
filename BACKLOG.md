@@ -4,7 +4,34 @@ Findings from a code audit of `5b6eaf4` (upstream `main`, 2026-03-01), performed
 
 Items have stable IDs so they can be referenced from commits and PRs. Severity reflects
 consequence, not effort. "Upstream" marks items that are plain bug fixes worth sending to
-`Altinus/Alt-Denoiser` rather than keeping on this fork.
+`Altinus/Alt-Denoiser` rather than keeping on this fork. The owner's decision is to fork and
+deviate, so nothing here is being sent upstream.
+
+## Status, 2026-09-09
+
+All 30 original findings are closed. Verified by `scripts/gate.sh`: a build, the offline
+harness across five geometries (480/48000, 512/48000, 1024/48000, 512/44100, 1024/96000),
+`pluginval` at strictness 5, and a packaging shape check, run identically locally and in CI on
+Windows, macOS and Linux.
+
+35 harness tests on the default build, 31 on each slim one. Every guard added this session was
+mutation tested: the guard was broken, the resulting failure was checked to name the right
+item, and the guard was restored. Those results are recorded in the commit messages rather
+than in a green run, because a green run proves nothing about whether the check can fail.
+
+What that discipline caught, in this repo, this session:
+- Three vacuous tests of my own. One counted `paint()` calls in a headless harness, where
+  `paint()` never runs. One ran a refusal against a virgin processor whose latency was already
+  zero. One wrapped its assertion in `if (xml != nullptr)`, so a typo would have reported PASS.
+- Three real defects of my own: a use-after-free between `worker.stop()` and `df_free`, an
+  unconditional `setLatencySamples` that reported 40 ms after a failed load, and attenuation
+  left on the audio thread after I claimed it had moved.
+- A coverage gap that no amount of reading would have found: H6 measures the plugin at
+  attenuation 0, which since L6 is fully dry, and the dry path is delayed by the derived
+  latency. H6 was comparing the derivation against itself and would have passed with a wrong
+  number. See 7a.
+- Two build configurations that do not compile or do not pass, found only by building all
+  three. See 7b.
 
 ## Method and coverage
 
@@ -28,10 +55,17 @@ These terminate the host process or corrupt memory.
 
 ### C1. A bad model file aborts the DAW instead of failing gracefully
 
-**MITIGATED, NOT CLOSED** (`388abbe`). The archive is now validated for write success and exact
-size before the path reaches Rust, so recoverable I/O errors fail here instead of panicking. A
-genuinely corrupt archive still aborts the host. Closing this needs a non-panicking entry point
-in `capi.rs`, which is a change to the vendored DeepFilterNet submodule.
+**FIXED** (`48f4ed4`). `libs/alt_df` replaces libDF's C API entirely. `alt_df_create` returns a
+status, validates its arguments before dereferencing anything, and wraps its body in
+`catch_unwind`, so a corrupt archive is a refused load and a bypassed plugin rather than a dead
+host. It also loads from memory, which deleted the temp-file staging that made C3, C4 and M6
+possible in the first place.
+
+Mutation tested in two parts, because the guard's value is the difference between them: a
+deliberate `panic!()` inside `alt_df_create` with `catch_unwind` intact runs all 26 tests and
+exits 1, while the same panic without it produces "thread caused non-unwinding panic. aborting.",
+exit 127, and zero test output. A `compile_error!` on `cfg(panic = "abort")` fails the build if
+the profile is ever changed, since `catch_unwind` is inert there and would fail silently.
 
 `Source/DeepFilterNetProcessor.cpp:43-44`
 
@@ -49,6 +83,10 @@ non-panicking entry point to `capi.rs` upstream. Until then, C3 and C4 are the r
 triggers and should be fixed first.
 
 ### C2. An inference error aborts the DAW mid-playback
+
+**FIXED** (`48f4ed4`). `alt_df_process_frame` returns a status, and a failed frame copies the
+input through so the caller emits the dry signal rather than repeating the previous frame
+forever. Same `catch_unwind` guard as C1.
 
 `Source/PluginProcessor.cpp:108`, mechanism in pinned `capi.rs`
 
@@ -280,11 +318,11 @@ latency.
 | M1 | `PluginProcessor.cpp:105-110` | **FIXED** (`0d389e6`); inference moved to a worker thread in `Source/InferenceWorker.h`, with a bounded offline wait, sequence-tagged frames so a locate discards in-flight work, and a latency-aligned dry fallback instead of zero-fill. No latency added. Was: inference runs on the audio thread with no bound on iterations: a 2048-sample block does 4-5 back-to-back model evaluations in one callback, with no worker thread and no deadline fallback. This is the architectural root cause behind H5 and the dropout reports. |
 | M2 | `PluginProcessor.cpp:56` | **FIXED** (`f6455ab` + `0d389e6`). Was: no `reset()` override and an empty `releaseResources()`, so roughly 450 samples of audio from the previous playhead plus stale model recurrent state survive every transport locate. |
 | M3 | `libs/Include/df.h:25` | **FIXED** (`f6455ab`); the hop is taken from `df_get_frame_length` and an implausible value falls back to bypass. Was: `df_get_frame_length` is declared but never called; 480 is hardcoded in five places. `df_process_frame` builds its views with `from_shape_ptr`, which does no bounds check, and the guarding `debug_assert` is compiled out in release. Any model swap becomes silent heap corruption. |
-| M4 | `CMakeLists.txt:86` | The model is embedded twice at source level, because `--features capi` also enables `default-model`, so libDF carries its own `include_bytes!` copy alongside the `juce_add_binary_data` one. **Measured: this does not reach the shipped binary.** The 7,983,136-byte archive appears exactly once in the released VST3 and once in the Standalone, so the linker drops the unreferenced copy. The cost is build time and intermediate size, not distribution size. It becomes real bloat the moment anything references `DfParams::default()`. Separately, `DfParams::from_bytes` would load the embedded copy with no filesystem involvement, deleting C3, C4 and M6 outright, but the pinned C API exposes only the path-based `df_create`, so that needs one new entry point upstream. |
+| M4 | `CMakeLists.txt:86` | **FIXED** (`48f4ed4`); `alt_df` sets `default-features = false`, so `default-model` never embeds anything. Was: the model is embedded twice at source level, because `--features capi` also enables `default-model`, so libDF carries its own `include_bytes!` copy alongside the `juce_add_binary_data` one. **Measured: this does not reach the shipped binary.** The 7,983,136-byte archive appears exactly once in the released VST3 and once in the Standalone, so the linker drops the unreferenced copy. The cost is build time and intermediate size, not distribution size. It becomes real bloat the moment anything references `DfParams::default()`. Separately, `DfParams::from_bytes` would load the embedded copy with no filesystem involvement, deleting C3, C4 and M6 outright, but the pinned C API exposes only the path-based `df_create`, so that needs one new entry point upstream. |
 | M5 | `PluginProcessor.h:62` | **FIXED** (`f6455ab`); returns 0.04 s. Was: `getTailLengthSeconds()` returns 0.0 despite roughly 40-50 ms of held state, so offline bounces can truncate the tail. |
 | M6 | `DeepFilterNetProcessor.cpp:29-41` | **FIXED** (`388abbe`) with C4. Was: the temp file is never deleted and grows by ~8 MB per `initialize()`, persisting across DAW restarts. |
-| M7 | `PluginProcessor.h` | No bypass parameter and no `processBlockBypassed`. Un-bypassing flushes stale pre-bypass audio and re-triggers the H5 splice. |
-| M8 | `PluginProcessor.h:16-35` | `SimpleFifo` has no capacity check on `push`, no floor on `discard`, and a signed/unsigned comparison at `:22` that converts a negative count into a full FIFO. Not reachable through current call sites because the guards live in the callers, but the class is unsafe as written. |
+| M7 | `PluginProcessor.h` | **FIXED** (`e06ea90`); a real `AudioParameterBool` with `getBypassParameter()` returning it, a per-channel host-rate delay primed to the reported latency, and a 10 ms crossfade. Bit-exact alignment, worst error 0.000000 over 26799 samples. `processBlockBypassed` routes through `processBlock` because the base implementation asserts zero latency. Note the trade-off: the model keeps running while bypassed, so BYPASS SAVES NO CPU. That is the only way un-bypassing cannot flush stale audio or re-trigger the H5 splice, because nothing is ever flushed. Was: no bypass parameter and no `processBlockBypassed`. |
+| M8 | `PluginProcessor.h:16-35` | **FIXED** (`ae692f0`); every operation bounds-checked and returning a refusal, with overflow and underflow counters, and a direct unit test. Was: no capacity check on `push`, no floor on `discard`, and a signed/unsigned comparison at `:22` that converted a negative count into a full FIFO. |
 | M9 | `PluginEditor.h:54-70` | **FIXED** (`8135ca5`); dt-based decay at 20 dB/s. Was: Meter ballistics decay at -116 dB/s against -20 to -26 dB/s for a standard digital peak meter, with no `dt` term, on a timer JUCE documents as imprecise at exactly this timescale. |
 | M10 | `PluginProcessor.cpp:71-76` | **FIXED** (`8135ca5`); running peak consumed by the UI. Was: The audio-side RMS EMA is applied once per block, so its time constant swings 32x with buffer size (1.9 ms at 64 samples, 61.6 ms at 2048). At small buffers roughly 92% of blocks are never sampled by the 60 Hz UI. A running max reset by the UI after reading would drop nothing. |
 | M11 | `PluginEditor.h:100`, `:152` | **FIXED** (`8135ca5`); one value drives both. Was: The meter bar reads from `smoothedLevel` and the number printed above it from `displayedDb`, on different decay rates, so they disagree after every transient. |
@@ -310,14 +348,50 @@ latency.
 
 ## Dead code
 
-- `PluginEditor.h:54` — `const float attack = 1.0f;` is never used. Attack is implemented as an instantaneous jump at `:57`.
-- `DeepFilterNetProcessor.h:19` — the `sampleRate` member is stored by the constructor and never read. `df_create` has no sample-rate parameter.
-- `libs/Include/df.h:25` — `df_get_frame_length` is never called (see M3).
-- `PluginProcessor.cpp:79-80` — the channel-clear loop never iterates in the declared stereo-in/stereo-out layout.
-- `PluginProcessor.cpp:56-57` — `releaseResources()` has an empty body (see M2).
-- `PluginEditor.h:189`, `:198` — the `apvts` constructor parameter and reference member are redundant; the same object is reachable as `audioProcessor.apvts`.
-- `DeepFilterNetProcessor.cpp:56` — the return value of `df_process_frame` is discarded. It is the per-frame local SNR and is the natural feed for a gate or a meaningful meter.
-- `df.h` omits four exported symbols: `df_set_post_filter_beta`, `df_next_log_msg`, `df_free_log_msg`, `df_process_frame_raw`.
+Re-verified 2026-09-09 against the current tree, because acting on the original list
+blindly would have removed things that had since become live and left things the original
+sweep never saw. Line numbers in the original entries were stale.
+
+### Closed
+
+| Original claim | Outcome |
+| :--- | :--- |
+| `PluginEditor.h:54` unused `attack` constant | Gone with the `DbMeter` rewrite (M9/M11/L3). The identifier no longer exists. |
+| `DeepFilterNetProcessor.h:19` unread `sampleRate` member | Removed with the shim rewrite. Nothing read it; the model is fixed at its own rate and the resampler owns conversion. |
+| `df_get_frame_length` never called | Became live under M3, then superseded: the shim reads `hop_size` from `alt_df_info`. `libs/Include/df.h` is deleted. |
+| channel-clear loop never iterates | Removed. `isBusesLayoutSupported` refuses any layout where the input and output sets differ, and one bus of each is declared, so the counts are always equal. |
+| `releaseResources()` empty | Stale. It calls `worker.stop()` and clears `modelLoaded`. |
+| `df.h` omits four exported symbols | Moot. `df.h` is deleted and `alt_df.h` declares exactly what `alt_df` exports. |
+
+### Found by the re-verification, now closed
+
+| Item | Outcome |
+| :--- | :--- |
+| `DeepFilterNetProcessor::setAttenLim` had zero callers | Removed, along with the `alt_df` setter it would have called. It went dead when L6 moved the attenuation crossfade onto the audio thread, leaving an FFI entry point reachable from nothing. |
+| `InferenceWorker::isActive`, `getPendingInput`, `getReadyOutput` | Removed. No callers anywhere, tests included. |
+| `DbMeter::getPaintCount` and its counter | Removed. It was the vacuous counter L1's test was originally written against: headless, `paint()` never runs, so it could not move whether the gate worked or not. `getRepaintRequests` replaced it. |
+| `PluginProcessor.cpp` `if (modelFrameLength <= 0) return;` in `reset()` | Removed. `modelFrameLength` is assigned only from a hop already range-checked `> 0 && <= 4096`, and its initialiser is 480, so no value can reach the branch. |
+| `libs/libDF/*` in `.gitignore` | Removed. That path has not existed for some time. |
+| The `.gitignore` line `*.dll *.lib *.a *.exp *.ilk *.pdb` | Split one per line. Gitignore does not split on whitespace, so it was a single pattern matching a file literally named that, and none of those extensions were ignored at all. Nothing leaked only because every build output already sat under an ignored directory. |
+| The About dialog's hardcoded "v1.0" | Now `JucePlugin_VersionString`. It had already drifted past the v1.0.1 release. |
+
+### Kept deliberately
+
+- `PluginProcessor.h` `if (! std::isfinite(db)) return 0.0f;` in `attenLimitToDryMix`. Currently
+  unreachable: `db` comes from a `NormalisableRange<float>(0, 100, 0.1)`, which cannot produce a
+  non-finite value. Kept because the cost is one instruction and the failure it prevents is a NaN
+  entering a `SmoothedValue`, which poisons the output permanently rather than glitching once.
+- The `apvts` reference in the editor. Read once, to build the `SliderAttachment`. Redundant with
+  `audioProcessor.apvts` but not dead.
+- `dryScratch` is sized `maxResampledSize + modelFrameLength` and indexed only to
+  `maxResampledSize`. The extra hop is unused headroom. Harmless, and shrinking it removes margin
+  from the one buffer that a resampler phase error would overrun first.
+
+### Still open
+
+- `alt_df_process_frame` writes the frame's local SNR to `out_lsnr` and
+  `DeepFilterNetProcessor::processFrame` discards it. It is the natural feed for a meaningful
+  meter or a gate, which is a feature rather than a fix.
 
 ---
 
@@ -402,20 +476,32 @@ match its claim, so the host over-compensates and the denoised track lands rough
 samples (9.9 ms) late relative to everything else. Correcting the number is both an alignment
 fix and a session-latency reduction.
 
-### LAT2. The low-latency model saves 20 ms, and costs 29 MB
+### LAT2. The low-latency model saves 20 ms, and costs far more than first measured
 
-Measured metadata for the two archives libDF can load:
+**SHIPPED** (`62d6374`, `4c9c590`). Both archives are embedded and selectable, the reported
+latency derives from the loaded model's geometry, and the editor states the cost before the
+user picks.
 
-| Model | lookahead | Algorithmic delay | Cost per hop | ONNX size |
-| :--- | ---: | ---: | ---: | ---: |
-| DeepFilterNet3 standard (current) | 2 | 1440 (30.0 ms) | 0.320 ms | 8.2 MB |
-| DeepFilterNet3 LL | 0 | 480 (10.0 ms) | 0.459 ms | 37.2 MB |
+Re-measured 2026-09-09 against the shim, timing 200 warmed-up frames per model rather than
+extrapolating:
 
-Switching to the LL model is by far the largest latency win available, cutting the model's
-own contribution from 30 ms to 10 ms. Note the naming is counterintuitive: LL is the *bigger
-and slower* network, so this trades roughly 29 MB of binary and 43% more CPU per hop for 20 ms
-of delay. Shipping both and letting the user choose is possible, but changing model at runtime
-changes reported latency, which hosts handle inconsistently.
+| Model | lookahead | Reported latency | Cost per 480-sample hop | % of one core | Embedded archive | Uncompressed ONNX |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| DeepFilterNet3 standard | 2 | 1920 (40 ms) | 0.907 ms | 9.1% | 7.98 MB | 8.59 MB |
+| DeepFilterNet3 LL | 0 | 960 (20 ms) | 2.670 ms | 26.7% | 36.36 MB | 39.0 MB |
+
+The size that matters is the compressed archive, since that is what JUCE embeds. The two are
+listed separately because the earlier estimate mixed them.
+
+The first estimate of "43% more CPU per hop" was wrong by a wide margin. It is about **2.9x**,
+and the archive is **4.6x** larger, not 29 MB more. The naming stays counterintuitive: LL names
+the delay, and it is the bigger network (`emb_hidden_dim` 512 against 256, `df_num_layers` 3
+against 2). Embedding both takes the Windows VST3 from 27.9 MB to 64.3 MB, which is why
+`ALTDENOISER_MODELS=standard` exists.
+
+Runtime switching is still not done, and still for the reason given: it would change the
+reported latency mid-session. The choice applies on the next `prepareToPlay`, and the parameter
+is marked non-automatable to say so.
 
 ### LAT3. Choosing a block size that is a multiple of 480 costs nothing
 
@@ -504,8 +590,26 @@ exit 0, zero errors.
   `CMAKE_BUILD_TYPE` was unused because the Windows generator is multi-config, which means
   single-config generators on Linux need it and multi-config ones need `--config`. The
   workflow passing both is what makes the matrix work.
-- Still open: `BYPRODUCTS` correctness (whether CMake rebuilds when Rust sources change), and
-  everything above re-verified on macOS and Linux runners.
+- ~~`BYPRODUCTS` correctness (whether CMake rebuilds when Rust sources change).~~
+  **RESOLVED 2026-09-09.** It does rebuild and relink correctly, but `BYPRODUCTS` is not what
+  makes that true, and the mechanism is worth knowing. The `add_custom_target(... ALL)` has a
+  stamp file that never exists plus `VerifyInputsAndOutputsExist=false` and no
+  `AdditionalInputs`, so it is unconditionally out of date and cargo does the source
+  fingerprinting. The relink happens because `IMPORTED_LOCATION` lands on the link line as an
+  absolute path that MSBuild's file tracker records as a read input (confirmed in
+  `link.read.1.tlog`); Ninja and Makefiles reach the same result through an explicit
+  dependency on the imported path. `BYPRODUCTS` itself only marks the file `GENERATED`, adds it
+  to the clean list, and on Ninja declares it an output of the edge. On the Visual Studio
+  generator the byproduct path appears nowhere in the generated project at all.
+- ~~A stale library could be linked silently.~~ **FIXED 2026-09-09.** `TARGET_RELEASE_DIR` is a
+  hardcoded path, so a `CARGO_TARGET_DIR` in the environment or a `[build] target-dir` in any
+  `.cargo/config.toml` above the crate sent cargo's output elsewhere while `IMPORTED_LOCATION`
+  kept pointing at whatever happened to be here. `--target-dir` is now passed explicitly.
+- Still open: `cargo build --release` is unconditional, so a `--config Debug` C++ build links
+  the Release Rust library and no configuration switch ever rebuilds it. Harmless today, since
+  ownership never crosses the CRT boundary, but it means a Debug build is not debuggable into
+  Rust.
+- Still open: everything above re-verified on macOS and Linux runners.
 
 **Validation** — `pluginval` 1.0.3 at strictness level 5, run 2026-09-08 against the Release
 VST3: **PASS, exit 0, zero warnings.**
@@ -532,24 +636,43 @@ absence of zero-runs in steady state, right-channel survival, and that the param
 the model. Roughly the coverage the comparable Rust project gets from its 28 tests.
 
 **CI** (`.github/workflows/build.yml`)
-- No `pluginval` and no `auval` on any platform, so nothing in this backlog is currently
-  caught before release. Adding `pluginval` is worth doing but see the caveat above about
-  what it does and does not detect.
+- ~~No `pluginval` and no `auval` on any platform.~~ **FIXED.** `scripts/gate.sh` runs the
+  build, the harness across five geometries, `pluginval` at strictness 5 and a packaging
+  shape check, identically locally and in CI, and reports `GATE PASSED (DEGRADED)` rather
+  than silently skipping when a stage cannot run. `auval` is still absent on macOS.
 - The artefacts path is no longer hardcoded: the staging step added in `a01cd73` locates the
   bundle and hard-fails on zero or multiple matches, so a wrong path on macOS or Linux now
   breaks the build loudly instead of publishing an empty archive. Confirmed working against a
   real Windows build tree.
-- No Rust build caching, so every run recompiles libDF from scratch (measured at 2m37s
-  locally for the Release profile alone).
+- ~~No Rust build caching.~~ **FIXED**, the workflow caches the cargo registry and target
+  directory.
+
+**Still open, and worth surfacing**
+- There is no ASAN or TSan job. The N2 use-after-free was found by reasoning and confirmed by
+  a 1-in-6 `STATUS_HEAP_CORRUPTION`, which is not a reliable detector. A sanitiser build of
+  the harness on Linux would turn that class of bug into a deterministic failure.
+- `setStateInformation` refusing a future schema keeps the CURRENT state rather than
+  restoring defaults, so switching to a preset saved by a newer build silently does nothing
+  instead of visibly resetting.
+- `schemaVersion` is written as an attribute on the APVTS root, which round-trips back into
+  the live parameter tree on load.
 
 **Resampler and latency derivation** (`modules/Resampler/`)
 - ~~The Catmull-Rom group delay per conversion stage, needed to close out H6.~~ **Measured at
   4 samples total for both stages combined**, via the offline harness at a block size that is a
   multiple of 480 (where the FIFO cushion is 0, so the residual delay is the resampler alone).
-- Whether the downsampling direction can overrun the buffers from the other side: `maxRatio`
-  is `48000/sampleRate`, so at 96 kHz the buffers are sized at half `samplesPerBlock` while
-  the 48k-to-96k output direction expands. Needs tracing at 96000 and 192000.
-- Which rates the library actually supports, versus the README's "any host sample rate".
+- ~~Whether the downsampling direction can overrun the buffers from the other side.~~
+  **RESOLVED 2026-09-09: it cannot, at any rate the guard permits.** The premise was wrong.
+  The expanding direction never writes into a ratio-scaled buffer: stage 3 of
+  `resampler::process` READS `resampleOutBuffer` and WRITES `monoBuffer`, which is sized to
+  the full host block. Stage 1 is the only writer into the ratio-scaled buffers, and with
+  `phi` the entering phase bounded in `[0, ts)` its output count is
+  `M <= floor(N * 48000 / sr) + 1 <= maxResampledSize - 127`, so both keep 127 spare floats
+  in the worst case at every rate from the 8 kHz floor to the 384 kHz ceiling.
+- ~~Which rates the library actually supports, versus the README's "any host sample rate".~~
+  **RESOLVED: 8 kHz to 384 kHz inclusive**, enforced in `prepareToPlay`. Outside that the
+  plugin refuses every block and passes audio through undenoised. The README claim is
+  corrected.
 - ~~The library's licence and its compatibility with LIC1.~~ **CC0 1.0 Universal** (public
   domain dedication), so compatible with anything, including AGPLv3.
 

@@ -149,8 +149,8 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     tempInputFrame.assign((size_t) modelFrameLength, 0.0f);
     tempOutputFrame.assign((size_t) modelFrameLength, 0.0f);
 
-    inputFifo.setSize(48000);
-    outputFifo.setSize(48000);
+    inputFifo.setSize(kFifoCapacity);
+    outputFifo.setSize(kFifoCapacity);
 
     // H5/H6: prime the output FIFO with one model hop of silence.
     //
@@ -245,7 +245,19 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // 48 kHz domain, so this is the derived figure directly rather than the
     // host-rate one.
     const int dryDelaySamples = derivedLatency48k;
-    dryDelay.setSize(48000);
+    dryDelay.setSize(kFifoCapacity);
+
+    // The one relationship that a fixed FIFO capacity can violate. dryDelay is
+    // primed with the whole reported latency, so a block that resamples to more
+    // than what is left cannot be pushed. SimpleFifo refuses rather than
+    // corrupting anything (M8), but the result is wrong audio and a bumped
+    // overflow counter, so it should be impossible rather than merely safe.
+    //
+    // It takes a host block of about 0.96 s to get there, which at the 8 kHz
+    // floor is 7680 samples. No host does that, but a scanner probing extremes
+    // might, and a silent failure is exactly what the rest of this file has
+    // spent the session removing.
+    jassert(maxResampledSize + dryDelaySamples <= kFifoCapacity);
     dryDelay.pushSilence(dryDelaySamples);
     primedDryDelay = dryDelaySamples;   // so reset() re-primes the same amount
     dryScratch.assign((size_t) (maxResampledSize + modelFrameLength), 0.0f);
@@ -333,9 +345,6 @@ void AltDenoiserProcessor::reset() {
         d.pushSilence(primed);
     }
 
-    if (modelFrameLength <= 0)
-        return;
-
     // Restore the H5/H6 priming cushion so the first block after the locate does
     // not underrun and splice in silence.
     outputFifo.pushSilence(modelFrameLength);
@@ -401,9 +410,11 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         return;
     }
 
-    // clear and parameter update
-    for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
-        buffer.clear(i, 0, buffer.getNumSamples());
+    // The JUCE template's "clear any output channels that have no input" loop
+    // used to live here. It could never iterate: isBusesLayoutSupported refuses
+    // any layout where the input and output sets differ, and only one bus of
+    // each is declared, so the two counts are always equal. Removed rather than
+    // left as boilerplate that reads like a real guard.
 
   if (modelAvailable) {
     // No null fallback: attenParam is set in the constructor from a parameter

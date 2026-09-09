@@ -114,8 +114,6 @@ public:
     // Test accessors.
     float getLevelDb() const noexcept { return levelDb; }
     float getHoldDb()  const noexcept { return holdDb; }
-    int   getPaintCount() const noexcept { return paintCount; }
-
     /** Counts repaint REQUESTS, not paints.
 
         A headless test never pumps a message loop, so paint() is never invoked
@@ -166,7 +164,6 @@ public:
 
     void paint(juce::Graphics& g) override
     {
-        ++paintCount;
 
         g.setColour(juce::Colour(0xff181818));
         g.fillRoundedRectangle(barRect, 2.0f);
@@ -249,7 +246,6 @@ private:
 
     int paintedBarY = -1;
     juce::String paintedReadout;
-    int paintCount = 0;
     int repaintRequests = 0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DbMeter)

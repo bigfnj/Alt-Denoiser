@@ -68,7 +68,15 @@ AltDenoiserEditor::AltDenoiserEditor(AltDenoiserProcessor& p, juce::AudioProcess
     aboutButton.onClick = [this] { juce::AlertWindow::showMessageBoxAsync(
             juce::AlertWindow::InfoIcon,
             "About",
-            "Alt Denoiser v1.0\n"
+            // Taken from the build rather than typed. It said "v1.0" while the
+            // last release was v1.0.1, and a hardcoded version in an About box
+            // drifts the moment anyone tags. JucePlugin_VersionString is not
+            // defined for the console test target, which compiles this file too.
+           #ifdef JucePlugin_VersionString
+            "Alt Denoiser v" JucePlugin_VersionString "\n"
+           #else
+            "Alt Denoiser\n"
+           #endif
             "By Altinus\n\n"
             "Credits:\n"
             "DeepFilterNet (Rikorose)\n"
