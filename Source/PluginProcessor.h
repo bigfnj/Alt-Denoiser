@@ -3,6 +3,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include "DeepFilterNetProcessor.h"
 #include "Resampler.hpp"
+#include <algorithm>
 #include <vector>
 #include <memory>
 
@@ -37,6 +38,11 @@ public:
     
     int getAvailable() const { return samplesInFifo; }
 
+    void clear() {
+        std::fill(buffer.begin(), buffer.end(), 0.0f);
+        writePos = 0; readPos = 0; samplesInFifo = 0;
+    }
+
 private:
     std::vector<float> buffer;
     int writePos = 0;
@@ -59,13 +65,22 @@ public:
     // while the host shifted the track by the reported latency.
     bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
 
+    // M2: hosts call reset() on a transport locate without re-preparing. Without
+    // it, up to one hop of audio from the previous playhead position stayed in
+    // the FIFOs and was replayed at the new position.
+    void reset() override;
+
     juce::AudioProcessorEditor* createEditor() override;
     bool hasEditor() const override { return true; }
     const juce::String getName() const override { return "Alt Denoiser"; }
     
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    // M5: was 0.0, which tells the host it may stop calling processBlock the
+    // moment input ends, truncating the tail of an offline bounce. The pipeline
+    // holds the reported latency (1920 samples at 48 kHz, and it scales with the
+    // rate, so 40 ms at any rate) before anything reaches the output.
+    double getTailLengthSeconds() const override { return 1920.0 / 48000.0; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -112,6 +127,7 @@ private:
     std::vector<float> resampleInBuffer;
     std::vector<float> resampleOutBuffer;
     std::vector<float> monoBuffer;   // H4: host-rate mono sum fed to the model
+    int modelFrameLength = 480;      // M3: hop size reported by the loaded model
 
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AltDenoiserProcessor)

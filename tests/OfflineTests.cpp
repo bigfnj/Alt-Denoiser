@@ -388,6 +388,64 @@ void testUnpreparedPassesAudioThrough()
               + " (peak 0 means the track was muted)");
 }
 
+//==============================================================================
+// T7 / M2 - reset() must not leave stale audio to be replayed.
+//
+// Hosts call reset() on a transport locate without re-preparing. Anything left
+// in the FIFOs would then be emitted at the new playhead position.
+
+void testResetDropsStaleAudio()
+{
+    AltDenoiserProcessor proc;
+    prepare (proc);
+    setAttenuation (proc, 0.0f);          // spectral passthrough
+
+    // Fill the pipeline with a loud tone.
+    double loudPeak = 0.0;
+    render (proc, 30,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [&loudPeak] (const juce::AudioBuffer<float>& b, int blk)
+            {
+                if (blk < 15) return;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    loudPeak = std::max (loudPeak, (double) std::abs (b.getSample (0, i)));
+            });
+
+    proc.reset();
+
+    // Now feed silence. Anything audible is a replay of the pre-reset content.
+    double leakedPeak = 0.0;
+    int leakedSamples = 0;      // how long the leak lasts, not just how loud
+    int lastLeakIndex = -1;
+    int sampleIndex = 0;
+    render (proc, 10,
+            [] (juce::AudioBuffer<float>& b, int) { b.clear(); },
+            [&] (const juce::AudioBuffer<float>& b, int)
+            {
+                for (int i = 0; i < b.getNumSamples(); ++i, ++sampleIndex)
+                {
+                    const auto v = (double) std::abs (b.getSample (0, i));
+                    leakedPeak = std::max (leakedPeak, v);
+                    if (v > 1.0e-3) { ++leakedSamples; lastLeakIndex = sampleIndex; }
+                }
+            });
+
+    // Silent output would ALSO result from the pipeline never having carried
+    // signal, so require a real pre-reset peak before believing it.
+    const bool wasLoud = (loudPeak > 0.1);
+    // A handful of samples is the resampler's 4-sample interpolation window,
+    // which is unavoidable without resetting it and is inaudible. A leak lasting
+    // hundreds of samples is the model's overlap-add and lookahead state being
+    // replayed at the new playhead position, which is the actual M2 defect.
+    const bool passed = wasLoud && (leakedSamples <= 8);
+    record ("reset drops stale audio", "M2", passed, Expect::Pass,
+            "pre-reset peak " + std::to_string (loudPeak)
+              + (wasLoud ? "" : "  <-- HARNESS BUG: pipeline was never loud")
+              + ", leaked " + std::to_string (leakedSamples) + " samples"
+              + ", peak " + std::to_string (leakedPeak)
+              + ", last at index " + std::to_string (lastLeakIndex));
+}
+
 } // namespace
 
 //==============================================================================
@@ -407,6 +465,7 @@ int main (int argc, char** argv)
     testReportedLatencyMatchesMeasured();
     testOversizedBlockIsRefused();
     testUnpreparedPassesAudioThrough();
+    testResetDropsStaleAudio();
 
     int unexpected = 0;
     for (const auto& r : results)

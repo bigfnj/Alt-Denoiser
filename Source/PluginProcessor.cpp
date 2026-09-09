@@ -20,21 +20,46 @@ juce::AudioProcessorValueTreeState::ParameterLayout AltDenoiserProcessor::create
 
     auto range = juce::NormalisableRange<float>(0.0f, 100.0f, 0.1f);
     range.setSkewForCentre(20.0f); 
+    // M13: without attributes the host's generic editor and automation lane
+    // show a bare "20.0" while the plugin UI shows "20.0 dB", and 100 is a
+    // sentinel meaning "no limit" that an automating host had no way to know.
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        "atten_lim", 
-        "Attenuation Limit", 
-        range, 
-        100.0f 
+        juce::ParameterID { "atten_lim", 1 },
+        "Reduction Limit",
+        range,
+        100.0f,
+        juce::AudioParameterFloatAttributes()
+            .withLabel("dB")
+            .withStringFromValueFunction([](float value, int) {
+                return value >= 99.95f ? juce::String("No limit")
+                                       : juce::String(value, 1) + " dB";
+            })
     ));
 
     return layout;
 }
 
 void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
+    // Build the model first: everything below is sized from what it reports.
+    modelLoaded = dfProcessor->initialize();
+
+    // M3: take the hop size from the model rather than assuming 480. Every
+    // archive libDF can load uses 480 today, but df_process_frame builds its
+    // ndarray views from the model's own hop_size with no bounds check, and the
+    // only guard inside libDF is a debug_assert compiled out in release. A
+    // mismatch would therefore be a silent heap overrun, not a clean failure.
+    const size_t reportedHop = dfProcessor->getFrameLength();
+    if (modelLoaded && (reportedHop == 0 || reportedHop > 4096)) {
+        DBG("Model reports an unusable hop size; bypassing");
+        modelLoaded = false;
+    }
+    modelFrameLength = modelLoaded ? (int) reportedHop : 480;
+
+    tempInputFrame.assign((size_t) modelFrameLength, 0.0f);
+    tempOutputFrame.assign((size_t) modelFrameLength, 0.0f);
+
     inputFifo.setSize(48000);
     outputFifo.setSize(48000);
-    tempInputFrame.resize(480, 0.0f);
-    tempOutputFrame.resize(480, 0.0f);
 
     // H5/H6: prime the output FIFO with one model hop of silence.
     //
@@ -46,25 +71,19 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // reported latency stayed a constant.
     //
     // Input and output rates are equal and the model is 1:1, so the only
-    // mismatch is quantisation to 480-sample hops. One hop of cushion therefore
-    // bounds the worst-case deficit, and the FIFO can no longer underrun.
+    // mismatch is quantisation to hop-sized frames. One hop of cushion bounds
+    // the worst-case deficit, and the FIFO can no longer underrun.
     //
     // This is also what the existing 1920 figure already assumed: 1440 samples
     // of model algorithmic delay ((960-480) + 2*480) plus 480 of cushion. The
     // number was right; the priming that would have made it true was missing.
     {
-        const std::vector<float> primingSilence((size_t) 480, 0.0f);
-        outputFifo.push(primingSilence.data(), 480);
+        const std::vector<float> primingSilence((size_t) modelFrameLength, 0.0f);
+        outputFifo.push(primingSilence.data(), modelFrameLength);
     }
 
     int latencyInHost = juce::roundToInt(1920.0 * (sampleRate / 48000.0));
     setLatencySamples(latencyInHost);
-
-    if (dfProcessor->initialize()) {
-        modelLoaded = true;
-    } else {
-        modelLoaded = false;
-    }
 
     // H2: initialize() builds a fresh DFState at a hardcoded 100 dB, but
     // lastAttenLim kept its old value, so the change-detector in processBlock
@@ -106,6 +125,39 @@ bool AltDenoiserProcessor::isBusesLayoutSupported(const BusesLayout& layouts) co
 
 void AltDenoiserProcessor::releaseResources() {
 }
+
+void AltDenoiserProcessor::reset() {
+    // M2: a transport locate calls reset() without re-preparing, so anything
+    // still buffered here would be replayed at the new playhead position. Clear
+    // both FIFOs and restore the H5/H6 priming cushion so the first block after
+    // the locate does not underrun and splice in silence.
+    inputFifo.clear();
+    outputFifo.clear();
+
+    if (modelFrameLength <= 0)
+        return;
+
+    // Restore the H5/H6 priming cushion so the first block after the locate does
+    // not underrun and splice in silence.
+    const std::vector<float> primingSilence((size_t) modelFrameLength, 0.0f);
+    outputFifo.push(primingSilence.data(), modelFrameLength);
+
+    // The model's own state is deliberately NOT reset. libDF exposes no reset
+    // entry point, and df_free plus df_create would re-read and re-parse the
+    // archive, far too slow for a locate and a crash surface besides (C1).
+    //
+    // An earlier version of this function flushed silent frames through the
+    // model on the theory that its overlap-add tail and lookahead would
+    // otherwise be replayed. Measurement refuted that: with the flush disabled
+    // the residue after a locate is identical, 3 samples ending at index 482,
+    // which is the resampler's 4-sample Catmull-Rom window arriving just after
+    // the priming cushion. The flush was removed rather than left as unjustified
+    // work on a path a host may call from the audio thread.
+    //
+    // Measured at attenuation 0, where the model returns its input immediately.
+    // The fully-processing case is not covered by that measurement.
+}
+
 
 void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages) {
     juce::ScopedNoDenormals noDenormals;
@@ -188,11 +240,11 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
             inputFifo.push(readPtr, sample_count_48k);
 
             // predict
-            while (inputFifo.getAvailable() >= 480) {
-                inputFifo.peek(tempInputFrame.data(), 480);
-                inputFifo.discard(480);
+            while (inputFifo.getAvailable() >= modelFrameLength) {
+                inputFifo.peek(tempInputFrame.data(), modelFrameLength);
+                inputFifo.discard(modelFrameLength);
                 dfProcessor->processFrame(tempInputFrame.data(), tempOutputFrame.data());
-                outputFifo.push(tempOutputFrame.data(), 480);
+                outputFifo.push(tempOutputFrame.data(), modelFrameLength);
             }
             // outputfifo ---> writePtr
             int samplesAvailable = outputFifo.getAvailable();
