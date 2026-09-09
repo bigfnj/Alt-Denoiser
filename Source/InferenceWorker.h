@@ -21,13 +21,21 @@
     and never allocate. Sub-hop accumulation stays on the audio thread in
     buffers it owns privately.
 
-    This also completes H3: the DFState is now owned exclusively by the worker,
-    which is the only thing that ever calls into libDF. Nothing else can observe
-    a half-published or freed model pointer.
+    This also completes H3: the worker is the only thing that ever calls INTO
+    the model. Be precise about what that does and does not mean, because the
+    stronger claim that used to sit here was false. The audio thread still reads
+    the pointer, in processBlock's `dfProcessor != nullptr && isReady()` test.
+    What makes that safe is the acquire on modelLoaded, which is released last in
+    prepareToPlay after every buffer is sized, plus the host contract that
+    prepareToPlay and processBlock do not overlap. It is not that the pointer is
+    unreachable from elsewhere.
 
     No extra latency is introduced. The output FIFO is already primed with one
     hop (H5/H6), which is 10 ms at 48 kHz of slack against a measured inference
-    cost of 0.32 ms per hop, so the existing cushion serves as the runway.
+    cost of 0.907 ms per hop for the standard model and 2.670 ms for the
+    low-latency one, so the existing cushion serves as the runway. (The 0.32 ms
+    figure this comment used to quote predated the shim and was measured
+    differently.)
 */
 
 //==============================================================================
@@ -150,20 +158,52 @@ public:
     }
 
 
-    /** Audio thread. Hands one hop to the worker and wakes it. */
+    /** Audio thread. Hands one hop to the worker and wakes it if it is asleep. */
     bool submit (unsigned sequence, const float* frame)
     {
-        const bool accepted = inbound.push (sequence, frame);
-        if (accepted)
-            framesAccepted.fetch_add (1, std::memory_order_release);
-        else
-            droppedFrames.fetch_add (1, std::memory_order_relaxed);
+        // Counted BEFORE the push, and rolled back on refusal.
+        //
+        // Incrementing afterwards left a window in which the worker could pop,
+        // infer and publish the result before the audio thread executed the
+        // increment. getInFlight() is accepted - collected - dropped, so it read
+        // -1, the offline drain loop's `> 0` test failed, and the block spliced
+        // one unnecessary dry frame. Rolling back can only make the count
+        // transiently HIGH, which makes that loop wait fractionally longer: the
+        // safe direction.
+        framesAccepted.fetch_add (1, std::memory_order_relaxed);
 
-        // Signalling an OS event rather than letting the worker poll matters on
-        // Windows, where a timed wait rounds up to the system timer resolution.
-        // Measured on this machine at default resolution, a 100 us sleep
-        // actually takes 15.5 ms, which would exceed the entire cushion.
-        wakeUp.signal();
+        const bool accepted = inbound.push (sequence, frame);
+        if (! accepted)
+        {
+            framesAccepted.fetch_sub (1, std::memory_order_relaxed);
+            droppedFrames.fetch_add (1, std::memory_order_relaxed);
+        }
+
+        // Only signal when the worker is actually asleep.
+        //
+        // juce::WaitableEvent::signal() takes a std::mutex and calls
+        // notify_all() under it (juce_WaitableEvent.cpp:69-75). There is no
+        // Windows SetEvent specialisation in JUCE 8; the std::mutex and
+        // std::condition_variable members are compiled on every platform. So
+        // this used to acquire a lock on the audio thread once per hop, about
+        // 100 times a second at 48 kHz, and unconditionally, including when the
+        // push had just been refused. If the worker were preempted inside its
+        // own brief hold of that mutex, the audio callback would block until it
+        // was rescheduled, with no priority inheritance to bound the wait.
+        //
+        // Under load, which is exactly when that inversion would bite, the
+        // worker is never asleep, so this is now a single acquire load and the
+        // lock is never touched.
+        //
+        // It cannot lose a wakeup. WaitableEvent LATCHES: a signal landing
+        // between the worker's re-check and its wait() makes that wait() return
+        // immediately rather than being missed. And if the flag reads false
+        // because the worker has not published it yet, the worker's own re-check
+        // of the queue sees the frame that was just pushed. The 20 ms timeout on
+        // that wait is the third backstop.
+        if (accepted && workerIsWaiting.load (std::memory_order_acquire))
+            wakeUp.signal();
+
         return accepted;
     }
 
@@ -245,6 +285,11 @@ private:
                 if (threadShouldExit())
                     return;
 
+                // The bool is not branched on here on purpose: processFrame has
+                // already copied the input through, which is the right
+                // degradation, and it counts the failure. The count is what
+                // makes it visible, through
+                // AltDenoiserProcessor::getInferenceFailures().
                 model->processFrame (scratchIn.data(), scratchOut.data());
 
                 // A full outbound queue means the audio thread has stopped
@@ -265,7 +310,18 @@ private:
             }
 
             if (! didWork)
-                wakeUp.wait (20);
+            {
+                workerIsWaiting.store (true, std::memory_order_release);
+
+                // Re-check AFTER publishing the flag. Without this the audio
+                // thread can push between the drain loop's last failed pop and
+                // the store above, read the flag as false, skip the signal, and
+                // leave a frame sitting until the timeout expires.
+                if (inbound.getNumReady() == 0)
+                    wakeUp.wait (20);
+
+                workerIsWaiting.store (false, std::memory_order_relaxed);
+            }
         }
     }
 
@@ -286,6 +342,10 @@ private:
     std::atomic<unsigned> framesAccepted { 0 };
     std::atomic<unsigned> framesCollected { 0 };
     std::atomic<unsigned> framesDroppedAfterAccept { 0 };
+
+    // True only while the worker is inside wakeUp.wait(). Lets submit() skip
+    // the mutex that signal() would otherwise take on the audio thread.
+    std::atomic<bool> workerIsWaiting { false };
 
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (InferenceWorker)

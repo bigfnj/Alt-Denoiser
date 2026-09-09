@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include "alt_df.h"
@@ -125,8 +126,18 @@ public:
 
     /** How many frames have failed inference since load. Non-zero means the
         model is returning errors and the wet path is passing dry audio.
+
+        Atomic because processFrame runs on the inference worker and this is read
+        from the message thread. Until it was surfaced through
+        AltDenoiserProcessor::getInferenceFailures, a model failing every frame
+        produced dry audio with nothing to show for it: fallbackSamples stays 0
+        because the worker DID deliver a frame, the dropped-frame count stays 0,
+        and the only other record was a DBG compiled out of Release.
     */
-    int getProcessFailures() const noexcept { return processFailures; }
+    int getProcessFailures() const noexcept
+    {
+        return processFailures.load (std::memory_order_relaxed);
+    }
 
 private:
     void release();
@@ -135,5 +146,5 @@ private:
     AltDfInfo   info   {};
     AltDfStatus lastStatus = ALT_DF_OK;
     DfnModel    loadedModel = DfnModel::Standard;
-    int         processFailures = 0;
+    std::atomic<int> processFailures { 0 };
 };

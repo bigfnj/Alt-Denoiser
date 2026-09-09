@@ -53,22 +53,48 @@ fi
 
 #------------------------------------------------------------------------------
 say "2. Offline harness across the geometry matrix"
-HARNESS=$(find "$BUILD_DIR" -type f \( -name AltDenoiserTests -o -name AltDenoiserTests.exe \) | head -n 1)
+# find_release: pick a RELEASE artefact, not merely the first one the filesystem
+# enumerates. Stage 1 builds --config Release, but a multi-config generator keeps
+# Debug output in the same tree, and a bare `head -n 1` could hand us that. It
+# matters more than usual here: the harness deliberately drives paths guarded by
+# jassertfalse (negative FIFO counts, refused geometry), so a Debug binary breaks
+# into the debugger instead of testing anything.
+find_release() {
+    _hits=$(find "$BUILD_DIR" "$@" 2>/dev/null)
+    _rel=$(printf '%s\n' "$_hits" | grep -i '/release/' | head -n 1)
+    if [ -n "$_rel" ]; then printf '%s\n' "$_rel"; else printf '%s\n' "$_hits" | head -n 1; fi
+}
+
+HARNESS=$(find_release -type f \( -name AltDenoiserTests -o -name AltDenoiserTests.exe \))
 if [ -z "$HARNESS" ]; then
     fail "AltDenoiserTests binary not found under $BUILD_DIR"
 else
+    printf '   harness:   %s\n' "$HARNESS"
     RUN=""
     if [ "${RUNNER_OS:-}" = "Linux" ] || { [ -z "${RUNNER_OS:-}" ] && [ "$(uname -s)" = "Linux" ]; }; then
         RUN="xvfb-run -a"
     fi
+    # A timeout, because the defect class L8 guards is a HANG, not wrong audio:
+    # an infinite resample ratio makes the resampler's inner loop never
+    # terminate. Without this a regression there stalls the gate until the
+    # job-level timeout rather than producing a red stage. 300 s is about 20x the
+    # slowest observed geometry.
+    TIMEOUT=""
+    command -v timeout > /dev/null 2>&1 && TIMEOUT="timeout 300"
+
     # The geometries that have historically behaved differently: a block size
     # that is an exact multiple of the 480-sample model hop, ones that are not,
     # and rates needing real resampling in both directions.
     for cfg in "480 48000" "512 48000" "1024 48000" "512 44100" "1024 96000"; do
-        if $RUN "$HARNESS" $cfg > /tmp/gate-harness.log 2>&1; then
+        if $RUN $TIMEOUT "$HARNESS" $cfg > /tmp/gate-harness.log 2>&1; then
             ok "harness $cfg"
         else
-            fail "harness $cfg"
+            _rc=$?
+            if [ "$_rc" = "124" ]; then
+                fail "harness $cfg TIMED OUT after 300 s"
+            else
+                fail "harness $cfg"
+            fi
             grep -E '^\[FAIL' /tmp/gate-harness.log || tail -10 /tmp/gate-harness.log
         fi
     done
@@ -76,11 +102,14 @@ fi
 
 #------------------------------------------------------------------------------
 say "3. pluginval (strictness 5)"
-BUNDLE=$(find "$BUILD_DIR" -type d -name '*.vst3' -prune -print | head -n 1)
+BUNDLE=$(find_release -type d -name '*.vst3' -prune -print)
 if [ -z "${PLUGINVAL:-}" ]; then
     skip "PLUGINVAL not set; format validation did not run"
-elif [ ! -x "${PLUGINVAL}" ] && [ ! -f "${PLUGINVAL}" ]; then
-    fail "PLUGINVAL points at '${PLUGINVAL}' which is not executable"
+# `||`, not `&&`. With `&&` an existing but non-executable file satisfied -f,
+# skipped the branch, and pluginval was run anyway; the only input that reached
+# this message was a path that did not exist, for which the message was wrong.
+elif [ ! -x "${PLUGINVAL}" ] || [ ! -f "${PLUGINVAL}" ]; then
+    fail "PLUGINVAL points at '${PLUGINVAL}', which is not an executable file"
 elif [ -z "$BUNDLE" ]; then
     fail "no .vst3 bundle found to validate"
 else
@@ -108,7 +137,11 @@ case "${RUNNER_OS:-$(uname -s)}" in
     *)            FORMATS="vst3" ;;
 esac
 for ext in $FORMATS; do
-    COUNT=$(find "$BUILD_DIR" -type d -name "*.${ext}" -prune -print | wc -l | tr -d ' ')
+    # Restricted to Release for the same reason stage 2 is: a tree built for both
+    # configurations holds two of each bundle and would fail this check for a
+    # reason that has nothing to do with packaging.
+    COUNT=$(find "$BUILD_DIR" -type d -name "*.${ext}" -prune -print 2>/dev/null \
+            | grep -ic '/release/' | tr -d ' ')
     if [ "$COUNT" = "1" ]; then
         ok "exactly one .${ext} bundle"
     else

@@ -27,6 +27,13 @@ AltDenoiserProcessor::AltDenoiserProcessor()
 }
 
 AltDenoiserProcessor::~AltDenoiserProcessor() {
+    // Explicit, though reverse-declaration-order destruction already runs
+    // ~InferenceWorker (which joins) before ~unique_ptr<DeepFilterNetProcessor>
+    // (which frees the model). Relying on that made teardown safety depend on
+    // the order of two member declarations with nothing saying so: reorder them
+    // and the worker calls processFrame on a freed model during host shutdown.
+    // This line makes the ordering explicit and costs one no-op call.
+    worker.stop();
 }
 
 juce::AudioProcessorValueTreeState::ParameterLayout AltDenoiserProcessor::createParameterLayout() 
@@ -223,7 +230,13 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     bypassMix.setCurrentAndTargetValue(
         (bypassParam != nullptr && bypassParam->get()) ? 1.0f : 0.0f);
 
-    attenMix.reset(sampleRate, kAttenRampSeconds);
+    // 48000, NOT sampleRate. getNextValue() is called once per 48 kHz sample
+    // inside the resampler callback, so priming the smoother with the host rate
+    // made the ramp last kAttenRampSeconds * hostRate / 48000 seconds: 100 ms at
+    // 96 kHz and 46 ms at 44.1 kHz against the intended 50 ms. bypassMix below
+    // is correct as it stands, because it is consumed at host rate in the output
+    // loop.
+    attenMix.reset(48000.0, kAttenRampSeconds);
     attenMix.setCurrentAndTargetValue(attenLimitToDryMix(attenParam->load(std::memory_order_relaxed)));
 
     // C5: remember what we sized the resample buffers for, so processBlock can
@@ -335,14 +348,20 @@ void AltDenoiserProcessor::reset() {
     // the audio thread by some hosts, and this path allocated twice per call.
     // The amount comes from what prepareToPlay actually primed rather than a
     // second copy of the 1920 literal, which could drift out of step with it.
+    // Guarded: after a refused prepare or a failed load these are 0, and
+    // pushSilence refuses a non-positive count with jassertfalse. The harness
+    // drives exactly that sequence, so a Debug run used to break into the
+    // debugger on the path L8 and M8 were meant to make safe.
     dryDelay.clear();
-    dryDelay.pushSilence(primedDryDelay);
+    if (primedDryDelay > 0)
+        dryDelay.pushSilence(primedDryDelay);
 
     // M7: the bypass delays hold a full latency window of pre-locate audio too.
     for (auto& d : bypassDelay) {
         const int primed = juce::jmax(0, getLatencySamples());
         d.clear();
-        d.pushSilence(primed);
+        if (primed > 0)
+            d.pushSilence(primed);
     }
 
     // Restore the H5/H6 priming cushion so the first block after the locate does
@@ -380,14 +399,6 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     const bool modelAvailable = modelLoaded.load(std::memory_order_acquire)
                                 && dfProcessor != nullptr && dfProcessor->isReady();
 
-    // M7: capture the untouched input FIRST. Everything below works in place,
-    // so this is the only point at which the dry signal still exists.
-    {
-        const int n = buffer.getNumSamples();
-        for (int ch = 0; ch < totalNumInputChannels && ch < (int) bypassDelay.size(); ++ch)
-            bypassDelay[(size_t) ch].push(buffer.getReadPointer(ch), n);
-    }
-
     // M10/L4: sample peak across ALL input channels, held until the editor
     // consumes it. AudioBuffer::getMagnitude(start, num) scans every channel, so
     // a right-channel-only source no longer reads as silence on the input meter.
@@ -408,6 +419,23 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         if (totalNumOutputChannels > 0)
             outputLevel.push(buffer.getMagnitude(0, buffer.getNumSamples()));
         return;
+    }
+
+    // M7: capture the untouched input. Everything below works in place, so this
+    // is the last point at which the dry signal still exists.
+    //
+    // It sits AFTER the C5 guard, not before it. Pushing first meant a refused
+    // block was pushed and never discarded, because the matching discard is at
+    // the end of processBlock and the guard returns before reaching it. The
+    // delay line then ran permanently long, so every subsequent bypassed sample
+    // was misaligned, and the next push was refused for want of free space. Not
+    // pushing at all for a refused block keeps the line consistent: that block
+    // passes through untouched, so there is nothing for the bypass path to
+    // reproduce.
+    {
+        const int n = buffer.getNumSamples();
+        for (int ch = 0; ch < totalNumInputChannels && ch < (int) bypassDelay.size(); ++ch)
+            bypassDelay[(size_t) ch].push(buffer.getReadPointer(ch), n);
     }
 
     // The JUCE template's "clear any output channels that have no input" loop

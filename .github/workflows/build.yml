@@ -63,15 +63,25 @@ jobs:
 
       # libDF is rebuilt from scratch on every run otherwise, measured at 2m37s
       # locally for the Release profile alone.
-      - name: Cache libDF build
+      # Caches libs/alt_df/target, which is where cargo writes since the shim
+      # replaced libDF's capi. This pointed at modules/DeepFilterNet/target until
+      # 2026-09-09, a directory nothing builds into any more, so every run after
+      # the shim landed recompiled tract from scratch and hit the cache on
+      # nothing but the registry.
+      #
+      # The key hashes libDF's sources as well as the shim's, because the shim
+      # takes libDF as a path dependency and a change there must invalidate. It
+      # hashes Cargo.lock too: the lockfile pins tract to 0.21.4, and libDF does
+      # not compile against the 0.21.18 a fresh resolution picks.
+      - name: Cache the Rust shim build
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            modules/DeepFilterNet/target
-          key: ${{ runner.os }}-libdf-${{ hashFiles('modules/DeepFilterNet/libDF/Cargo.toml', 'modules/DeepFilterNet/libDF/src/**') }}
-          restore-keys: ${{ runner.os }}-libdf-
+            libs/alt_df/target
+          key: ${{ runner.os }}-alt-df-${{ hashFiles('libs/alt_df/Cargo.lock', 'libs/alt_df/Cargo.toml', 'libs/alt_df/src/**', 'modules/DeepFilterNet/libDF/Cargo.toml', 'modules/DeepFilterNet/libDF/src/**') }}
+          restore-keys: ${{ runner.os }}-alt-df-
 
       # Note on the two build-type flags: they are not redundant. CMake reports
       # CMAKE_BUILD_TYPE as unused on multi-config generators (Windows, Xcode),

@@ -15,7 +15,7 @@ void DeepFilterNetProcessor::release()
         state = nullptr;
     }
     info = {};
-    processFailures = 0;
+    processFailures.store (0, std::memory_order_relaxed);
 }
 
 // Which archives this build embedded. Set from CMake's ALTDENOISER_MODELS.
@@ -140,7 +140,12 @@ bool DeepFilterNetProcessor::initializeFromMemory (const void* modelData, int mo
     if (lastStatus != ALT_DF_OK || state == nullptr)
     {
         DBG ("alt_df_create failed: " << alt_df_status_str (lastStatus));
-        state = nullptr;
+
+        // release() rather than a bare null assignment. alt_df_create does
+        // guarantee *out_state is NULL on every non-OK return, but relying on
+        // that makes this line a leak the moment the Rust side ever writes the
+        // handle before a fallible step. Freeing a null is a no-op.
+        release();
         return false;
     }
 
@@ -176,7 +181,7 @@ bool DeepFilterNetProcessor::processFrame (const float* input, float* output) {
         // forever. A dry frame is the correct degradation: it is what the
         // plugin already does when no model is loaded at all.
         std::memcpy (output, input, hop * sizeof (float));
-        ++processFailures;
+        processFailures.fetch_add (1, std::memory_order_relaxed);
         lastStatus = status;
         return false;
     }

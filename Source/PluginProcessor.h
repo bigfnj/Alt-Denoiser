@@ -189,6 +189,12 @@ public:
         // would be unreachable and could never be mutation-tested. Writing a
         // zero-length block would also be worse than crashing, since a host
         // cannot distinguish it from "this plugin has no state".
+        // Written as an attribute on the APVTS root. ValueTree::fromXml turns
+        // every attribute into a property, so on load this reappears as a
+        // property of the live parameter tree. APVTS only looks at child PARAM
+        // nodes, so it is inert, and the next save overwrites it with the same
+        // value. Noted because it looks like a leak into the parameter state and
+        // is not one.
         xml->setAttribute("schemaVersion", kStateSchemaVersion);
         copyXmlToBinary(*xml, destData);
     }
@@ -205,7 +211,19 @@ public:
                 // builds predating this check still load.
                 if (xmlState->getIntAttribute("schemaVersion", 0) > kStateSchemaVersion)
                 {
-                    jassertfalse;   // written by a newer build; keep defaults
+                    // Written by a newer build. Refusing it whole is right:
+                    // loading half a state is worse than loading none.
+                    //
+                    // But be precise about what "refuse" means here, because the
+                    // comment used to say "keep defaults" and that is only true
+                    // on a virgin instance. What actually happens is that the
+                    // CURRENT state is kept, so a user switching from one preset
+                    // to a newer-build preset sees nothing change at all rather
+                    // than seeing it reset. Deliberately not changed to a reset:
+                    // destroying settings the user can still see is a worse
+                    // outcome than a no-op, and the jassert catches it in a
+                    // Debug build.
+                    jassertfalse;
                     return;
                 }
 
@@ -349,6 +367,17 @@ public:
     */
     std::atomic<unsigned> fallbackSamples { 0 };
     int getWorkerDroppedFrames() const { return worker.getDroppedFrames(); }
+
+    /** Frames the model refused to process since the last load.
+
+        Non-zero means alt_df returned an error per frame and the wet path is
+        carrying dry audio. That is the correct degradation and it is silent, so
+        this is the only way to tell it apart from working normally.
+    */
+    int getInferenceFailures() const
+    {
+        return dfProcessor != nullptr ? dfProcessor->getProcessFailures() : 0;
+    }
 
     /** L6: the dry proportion currently being mixed, 0 = fully enhanced and
         1 = fully dry. Trails the parameter only for the ramp length.

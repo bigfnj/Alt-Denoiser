@@ -214,7 +214,13 @@ pub unsafe extern "C" fn alt_df_info(st: *const AltDf, out_info: *mut AltDfInfo)
 ///
 /// `out_lsnr` receives the frame's local SNR in dB and may be NULL.
 ///
-/// Real-time safe: no allocation, no locking, no I/O on the success path.
+/// NOT real-time safe, despite what this comment used to claim. tract allocates
+/// per frame: DfTract::process calls SimpleState::run on three models, each of
+/// which builds a fresh output TVec and heap tensors, and it also emits a
+/// log::warn! on any frame peaking above 0.9999. Call it from a worker thread,
+/// which is what Source/InferenceWorker.h exists for. This note is here because
+/// the old claim was exactly the licence someone would cite to move the call
+/// back onto the audio callback.
 ///
 /// # Safety
 /// `st` must be a live handle. `input` must point to `input_len` readable
@@ -307,16 +313,23 @@ pub unsafe extern "C" fn alt_df_free(st: *mut AltDf) {
 }
 
 /// A short static description of a status, for logging. Never NULL.
+///
+/// Takes an i32, not an [`AltDfStatus`]. Matching a `#[repr(C)]` fieldless enum
+/// received from C is only sound if the discriminant is one the enum declares,
+/// and rustc is entitled to compile such a match into an unbounded jump. C
+/// cannot promise that, so this takes the integer and falls through to a
+/// default. The ABI is unchanged, since a C enum is an int.
 #[no_mangle]
-pub extern "C" fn alt_df_status_str(status: AltDfStatus) -> *const std::os::raw::c_char {
+pub extern "C" fn alt_df_status_str(status: i32) -> *const std::os::raw::c_char {
     let s: &'static [u8] = match status {
-        AltDfStatus::Ok => b"ok\0",
-        AltDfStatus::NullArg => b"a required argument was null\0",
-        AltDfStatus::BadModel => b"the model archive could not be parsed\0",
-        AltDfStatus::Init => b"the DeepFilter runtime could not be initialised\0",
-        AltDfStatus::BadLength => b"a buffer length did not match the model hop size\0",
-        AltDfStatus::Process => b"inference failed on this frame\0",
-        AltDfStatus::Panic => b"a panic was caught at the FFI boundary\0",
+        0 => b"ok\0",
+        1 => b"a required argument was null\0",
+        2 => b"the model archive could not be parsed\0",
+        3 => b"the DeepFilter runtime could not be initialised\0",
+        4 => b"a buffer length did not match the model hop size\0",
+        5 => b"inference failed on this frame\0",
+        6 => b"a panic was caught at the FFI boundary\0",
+        _ => b"unknown status\0",
     };
     s.as_ptr() as *const std::os::raw::c_char
 }

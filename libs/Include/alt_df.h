@@ -23,7 +23,13 @@
 extern "C" {
 #endif
 
-/* Opaque handle to a loaded model. */
+/* Opaque handle to a loaded model.
+ *
+ * Calls on ONE handle must not overlap. alt_df_process_frame takes it mutably
+ * and alt_df_info takes it shared, so concurrent calls would alias. Different
+ * handles are independent. The plugin honours this by calling alt_df_info once
+ * on the message thread before the worker thread starts.
+ */
 typedef struct AltDf AltDf;
 
 /* Result of every entry point. 0 is success. */
@@ -81,7 +87,11 @@ AltDfStatus alt_df_info(const AltDf* st, AltDfInfo* out_info);
  * heap overrun rather than an error.
  *
  * out_lsnr receives the frame's local SNR in dB and may be NULL.
- * Real-time safe: no allocation, no locking, no I/O on the success path.
+ *
+ * NOT real-time safe. tract allocates per frame and logs a warning on any frame
+ * peaking above 0.9999, so call this from a worker thread. The earlier claim
+ * that it was RT-safe was wrong, and it was exactly the licence someone would
+ * cite to move inference back onto the audio callback.
  */
 AltDfStatus alt_df_process_frame(AltDf*       st,
                                  const float* input,
@@ -100,8 +110,11 @@ AltDfStatus alt_df_process_frame(AltDf*       st,
 /* Frees a handle. NULL is accepted and ignored. */
 void alt_df_free(AltDf* st);
 
-/* A short static description of a status, for logging. Never NULL. */
-const char* alt_df_status_str(AltDfStatus status);
+/* A short static description of a status, for logging. Never NULL, and total:
+ * an unrecognised value returns "unknown status" rather than being undefined.
+ * Takes an int so that is true even for a value the enum does not declare.
+ */
+const char* alt_df_status_str(int status);
 
 #ifdef __cplusplus
 }
