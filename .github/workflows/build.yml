@@ -128,6 +128,14 @@ jobs:
           echo "Found bundle: $bundle"
           mkdir -p dist
           cp -R "$bundle" dist/
+
+          # LIC1: this is an AGPLv3 work, so the licence must travel with the
+          # binary. Upstream published releases with no licence text at all,
+          # because the repository had no LICENSE file to include.
+          test -f LICENSE || { echo "::error::LICENSE is missing"; exit 1; }
+          cp LICENSE dist/
+          cp README.md dist/
+
           find dist -type f -print
 
       - name: Upload artifact

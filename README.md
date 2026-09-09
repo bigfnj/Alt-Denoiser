@@ -2,7 +2,7 @@
 
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-brightgreen)
 ![Format](https://img.shields.io/badge/Format-VST3%20%7C%20AU%20%7C%20LV2%20%7C%20Standalone-blue)
-![License](https://img.shields.io/badge/License-GPLv3-red)
+![License](https://img.shields.io/badge/License-AGPLv3-red)
 
 **Alt Denoiser** is a real-time AI audio noise suppression plugin based on **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)**. It wraps the open-source DeepFilterNet model into a ready-to-use audio plugin, supporting Windows, macOS, and Linux platforms in VST3, Standalone, AU, and LV2 formats.
 
@@ -87,13 +87,36 @@ Copy the generated plugin files (`.vst3` / `.component`) to your system's plugin
 
 ---
 
+## Modifications / 修改说明
+
+This is a modified fork of [Altinus/Alt-Denoiser](https://github.com/Altinus/Alt-Denoiser).
+Modifications began on 2026-09-08 and are ongoing. They include removing VST2,
+moving DeepFilterNet inference off the audio callback, and a number of audio
+correctness fixes. See `BACKLOG.md` for the itemised list and `git log` for
+dates, as required by AGPLv3 section 5(a).
+
+本项目是 [Altinus/Alt-Denoiser](https://github.com/Altinus/Alt-Denoiser) 的修改版分支，
+自 2026-09-08 起持续修改。详见 `BACKLOG.md` 与 `git log`。
+
 ## License / 开源协议
 
-This project is licensed under the **GPLv3** License.
-本项目遵循 **GPLv3** 协议。
+This project is licensed under the **GNU Affero General Public License v3.0**.
+The full text is in [LICENSE](LICENSE).
+本项目遵循 **AGPLv3** 协议，完整文本见 [LICENSE](LICENSE)。
 
-* **[JUCE](https://github.com/juce-framework/JUCE)** (GPLv3)
-* **[DeepFilterNet](https://github.com/Rikorose/DeepFilterNet)** (MIT/Apache-2.0)
+The upstream README stated GPLv3. That is incorrect for the JUCE version this
+project builds against: the pinned JUCE 8 submodule is dual-licensed AGPLv3 or
+commercial, and a JUCE 8 derivative cannot be distributed under plain GPLv3 with
+the AGPLv3 section 13 obligation dropped. Anyone wanting to ship this under
+different terms needs a commercial JUCE licence.
+
+Component licences:
+
+| Component | Licence |
+| :--- | :--- |
+| [JUCE](https://github.com/juce-framework/JUCE) 8 | AGPLv3 or commercial |
+| [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) | MIT / Apache-2.0 |
+| [Resampler](https://github.com/niswegmann/Resampler) | CC0-1.0 (public domain) |
 
 ## Credits / 致谢
 

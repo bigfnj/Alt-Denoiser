@@ -140,6 +140,10 @@ Fix: reset `lastAttenLim` in `prepareToPlay`, or pass the current parameter valu
 
 ### H3. `state` and `modelLoaded` are shared across threads with no synchronisation
 
+**FIXED** (`93bf963` + `0d389e6`). `modelLoaded` is `std::atomic<bool>`, published with release
+ordering at the very end of `prepareToPlay` after every buffer it guards. The `DFState` pointer
+is now owned exclusively by the inference worker, so no other thread calls into libDF at all.
+
 `Source/DeepFilterNetProcessor.h:18`, `Source/PluginProcessor.h:101`
 
 A plain pointer and a plain `bool`, written from the `prepareToPlay` thread and read from the
@@ -273,11 +277,11 @@ latency.
 
 | ID | Location | Issue |
 | :--- | :--- | :--- |
-| M1 | `PluginProcessor.cpp:105-110` | Inference runs on the audio thread with no bound on iterations: a 2048-sample block does 4-5 back-to-back model evaluations in one callback, with no worker thread and no deadline fallback. This is the architectural root cause behind H5 and the dropout reports. |
-| M2 | `PluginProcessor.cpp:56` | No `reset()` override and an empty `releaseResources()`, so roughly 450 samples of audio from the previous playhead plus stale model recurrent state survive every transport locate. |
-| M3 | `libs/Include/df.h:25` | `df_get_frame_length` is declared but never called; 480 is hardcoded in five places. `df_process_frame` builds its views with `from_shape_ptr`, which does no bounds check, and the guarding `debug_assert` is compiled out in release. Any model swap becomes silent heap corruption. |
+| M1 | `PluginProcessor.cpp:105-110` | **FIXED** (`0d389e6`); inference moved to a worker thread in `Source/InferenceWorker.h`, with a bounded offline wait, sequence-tagged frames so a locate discards in-flight work, and a latency-aligned dry fallback instead of zero-fill. No latency added. Was: inference runs on the audio thread with no bound on iterations: a 2048-sample block does 4-5 back-to-back model evaluations in one callback, with no worker thread and no deadline fallback. This is the architectural root cause behind H5 and the dropout reports. |
+| M2 | `PluginProcessor.cpp:56` | **FIXED** (`f6455ab` + `0d389e6`). Was: no `reset()` override and an empty `releaseResources()`, so roughly 450 samples of audio from the previous playhead plus stale model recurrent state survive every transport locate. |
+| M3 | `libs/Include/df.h:25` | **FIXED** (`f6455ab`); the hop is taken from `df_get_frame_length` and an implausible value falls back to bypass. Was: `df_get_frame_length` is declared but never called; 480 is hardcoded in five places. `df_process_frame` builds its views with `from_shape_ptr`, which does no bounds check, and the guarding `debug_assert` is compiled out in release. Any model swap becomes silent heap corruption. |
 | M4 | `CMakeLists.txt:86` | The model is embedded twice at source level, because `--features capi` also enables `default-model`, so libDF carries its own `include_bytes!` copy alongside the `juce_add_binary_data` one. **Measured: this does not reach the shipped binary.** The 7,983,136-byte archive appears exactly once in the released VST3 and once in the Standalone, so the linker drops the unreferenced copy. The cost is build time and intermediate size, not distribution size. It becomes real bloat the moment anything references `DfParams::default()`. Separately, `DfParams::from_bytes` would load the embedded copy with no filesystem involvement, deleting C3, C4 and M6 outright, but the pinned C API exposes only the path-based `df_create`, so that needs one new entry point upstream. |
-| M5 | `PluginProcessor.h:62` | `getTailLengthSeconds()` returns 0.0 despite roughly 40-50 ms of held state, so offline bounces can truncate the tail. |
+| M5 | `PluginProcessor.h:62` | **FIXED** (`f6455ab`); returns 0.04 s. Was: `getTailLengthSeconds()` returns 0.0 despite roughly 40-50 ms of held state, so offline bounces can truncate the tail. |
 | M6 | `DeepFilterNetProcessor.cpp:29-41` | **FIXED** (`388abbe`) with C4. Was: the temp file is never deleted and grows by ~8 MB per `initialize()`, persisting across DAW restarts. |
 | M7 | `PluginProcessor.h` | No bypass parameter and no `processBlockBypassed`. Un-bypassing flushes stale pre-bypass audio and re-triggers the H5 splice. |
 | M8 | `PluginProcessor.h:16-35` | `SimpleFifo` has no capacity check on `push`, no floor on `discard`, and a signed/unsigned comparison at `:22` that converts a negative count into a full FIFO. Not reachable through current call sites because the guards live in the callers, but the class is unsafe as written. |
@@ -285,7 +289,7 @@ latency.
 | M10 | `PluginProcessor.cpp:71-76` | The audio-side RMS EMA is applied once per block, so its time constant swings 32x with buffer size (1.9 ms at 64 samples, 61.6 ms at 2048). At small buffers roughly 92% of blocks are never sampled by the 60 Hz UI. A running max reset by the UI after reading would drop nothing. |
 | M11 | `PluginEditor.h:100`, `:152` | The meter bar reads from `smoothedLevel` and the number printed above it from `displayedDb`, on different decay rates, so they disagree after every transient. |
 | M12 | `PluginProcessor.h:47-110` | **FIXED** (`9fd5b6f`); pluginval now reports only `Mono, Stereo`. Was: no `isBusesLayoutSupported`. Mono is genuinely safe (every index traced and guarded), but any layout with 3 or more outputs leaves channels 2 and up unprocessed and undelayed while the host shifts the whole track by the reported latency. |
-| M13 | `PluginProcessor.cpp:21-28` | The parameter has no unit label and no string-from-value function, so hosts show a bare "20.0"; the automation lane reads "Attenuation Limit" while the visible knob reads "Reduction"; and 100 is an undocumented sentinel meaning "no limit". |
+| M13 | `PluginProcessor.cpp:21-28` | **FIXED** (`f6455ab`); label, string-from-value, and the display name reconciled with the knob. Was: the parameter has no unit label and no string-from-value function, so hosts show a bare "20.0"; the automation lane reads "Attenuation Limit" while the visible knob reads "Reduction"; and 100 is an undocumented sentinel meaning "no limit". |
 
 ---
 
@@ -440,6 +444,12 @@ improvement on the current claim, at the cost of a 29 MB larger binary.
 
 ### LIC1. No licence file, and the stated licence is wrong for the pinned JUCE
 
+**FIXED** (`this commit`). Canonical AGPLv3 text added as `LICENSE` (661 lines, SHA-256
+`0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0`, includes section 13 Remote
+Network Interaction). README badge and licence section corrected, component licences tabulated,
+and an AGPLv3 section 5(a) modification notice added. The release workflow now copies `LICENSE`
+and `README.md` into the package and hard-fails if `LICENSE` is absent, mutation-tested.
+
 The repository has no `LICENSE` or `COPYING` file; the GitHub API reports `license: null`. The
 only claim is a README badge reading GPLv3.
 
@@ -540,7 +550,8 @@ the model. Roughly the coverage the comparable Rust project gets from its 28 tes
   is `48000/sampleRate`, so at 96 kHz the buffers are sized at half `samplesPerBlock` while
   the 48k-to-96k output direction expands. Needs tracing at 96000 and 192000.
 - Which rates the library actually supports, versus the README's "any host sample rate".
-- The library's licence and its compatibility with LIC1.
+- ~~The library's licence and its compatibility with LIC1.~~ **CC0 1.0 Universal** (public
+  domain dedication), so compatible with anything, including AGPLv3.
 
 ---
 
