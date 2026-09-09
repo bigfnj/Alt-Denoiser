@@ -94,7 +94,7 @@ forever. Same `catch_unwind` guard as C1.
 error returned by the tract runtime during live playback terminates the host from inside the
 audio callback. Same abort-on-unwind path as C1.
 
-### C3. Fixed shared temp-file path makes C1 reachable in normal use  — Upstream
+### C3. Fixed shared temp-file path makes C1 reachable in normal use (upstreamable)
 
 **FIXED** (`388abbe`). Staged via `juce::File::createTempFile`, so every instance and process gets
 a unique path.
@@ -109,7 +109,7 @@ normal use case for a denoiser.
 
 Fix: `juce::TemporaryFile`, or skip the filesystem entirely per M4.
 
-### C4. The temp file appends instead of truncating — Upstream
+### C4. The temp file appends instead of truncating (upstreamable)
 
 **FIXED** (`388abbe`). Written fresh and deleted as soon as `df_create` has read it, which also
 closes M6. Confirmed in the wild: `%TEMP%lt_denoiser_model.tar.gz` had reached 582,768,928
@@ -145,7 +145,7 @@ VST2's `effSetBlockSize` is advisory, and this project builds VST2 unconditional
 
 ## High
 
-### H1. Every `prepareToPlay` leaks an entire model — Upstream
+### H1. Every `prepareToPlay` leaks an entire model (upstreamable)
 
 **FIXED** (`388abbe`). `initialize()` frees the previous `DFState` before replacing it.
 
@@ -155,7 +155,7 @@ VST2's `effSetBlockSize` is advisory, and this project builds VST2 unconditional
 so the only free is in the destructor, and only for the last instance. Every sample-rate or
 buffer-size change leaks a full ONNX session plus weights.
 
-### H2. The attenuation knob stops working after any re-prepare — Upstream
+### H2. The attenuation knob stops working after any re-prepare (upstreamable)
 
 **FIXED** (`388abbe`). `prepareToPlay` resets `lastAttenLim` to its sentinel. Harness now
 measures RMS 0.176713 before and after a re-prepare, ratio exactly 1.000000.
@@ -573,7 +573,7 @@ Recorded so these are not "fixed" into breakage later.
 
 Two domains were not audited. Open questions:
 
-**Build system** (`CMakeLists.txt`) — RESOLVED 2026-09-08 by building locally on Windows
+**Build system** (`CMakeLists.txt`): RESOLVED 2026-09-08 by building locally on Windows
 (MSVC 19.51, Visual Studio generator). Both Release and Debug configurations built clean,
 exit 0, zero errors.
 
@@ -611,7 +611,7 @@ exit 0, zero errors.
   Rust.
 - Still open: everything above re-verified on macOS and Linux runners.
 
-**Validation** — `pluginval` 1.0.3 at strictness level 5, run 2026-09-08 against the Release
+**Validation**: `pluginval` 1.0.3 at strictness level 5, run 2026-09-08 against the Release
 VST3: **PASS, exit 0, zero warnings.**
 
 That result is important mainly for what it does *not* mean. It passed with every finding in
@@ -675,6 +675,31 @@ the model. Roughly the coverage the comparable Rust project gets from its 28 tes
   corrected.
 - ~~The library's licence and its compatibility with LIC1.~~ **CC0 1.0 Universal** (public
   domain dedication), so compatible with anything, including AGPLv3.
+
+---
+
+## Where to pick up
+
+Read this section and the ranked table below it; everything above is history.
+
+Session closed 2026-09-09 with a clean tree, all work on `main`, CI green on three platforms.
+Nothing is half-finished and no branch is outstanding.
+
+To rebuild and verify, from the repo root:
+
+    CMAKE="/c/Program Files/CMake/bin/cmake.exe" PLUGINVAL=<path to pluginval.exe> bash scripts/gate.sh build
+
+The `CMAKE` override is not optional under Git Bash, which resolves a bundled cmake 3.31 that
+shadows the real install and cannot load the Visual Studio generator. Without `PLUGINVAL` the
+gate reports `GATE PASSED (DEGRADED)`, which is not a pass.
+
+`libs/alt_df/Cargo.lock` is committed and load-bearing: it pins tract to 0.21.4, and a fresh
+resolution picks 0.21.18, against which the vendored libDF does not compile. Seed it from
+`modules/DeepFilterNet/Cargo.lock` rather than regenerating it.
+
+Highest-value next items, in order: A17 (nothing measures denoising), A10 (JUCE compiles
+twice), A11 (cargo cache key omits the toolchain), A22 (the model-embedding default, which is
+an owner decision rather than a fix).
 
 ---
 
@@ -762,17 +787,18 @@ building a bare `main()`, so treat it as confirmed rather than new.
 
 ---
 
-## Suggested first milestone
+## Historical: the suggested first milestone
 
-Three one-line changes with outsized effect, all upstreamable:
+Kept for the record, because it is a fair snapshot of what the audit thought mattered on
+2026-09-08 and all of it shipped within a day.
 
-1. H1 — free `state` before reassigning it.
-2. C3 — give the temp file a unique name per instance via `juce::TemporaryFile`.
-3. H2 — reset `lastAttenLim` in `prepareToPlay`.
+It proposed three one-line changes: H1, free `state` before reassigning it; C3, give the temp
+file a unique name per instance; H2, reset the attenuation sentinel in `prepareToPlay`. Then
+the item it called the one that changes the product's failure mode: H7, bypass instead of
+`buffer.clear()`, and guard `df_create` so a panic cannot cross the FFI boundary.
 
-That removes the leak, the crash-on-second-instance, and the dead knob.
-
-Then the item that changes the product's failure mode: H7, bypass instead of `buffer.clear()`,
-and guard the `df_create` call so a panic cannot cross the FFI boundary. A denoiser that mutes
-the track is worse than one that passes it through, and one that kills the DAW is worse than
-both.
+All four are closed. Two of them turned out differently than proposed and the difference is
+worth keeping. C3 was not fixed by a unique temp name in the end; the temp file was deleted
+outright when the shim gained the ability to load from memory. And the `df_create` guard could
+not be written on the C++ side at all, because the panic originated inside Rust: it needed the
+shim (C1/C2).
