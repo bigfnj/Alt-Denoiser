@@ -275,10 +275,25 @@ private:
     juce::Label attenLabel;
     juce::TextButton aboutButton { "i" };
 
+    // 7c: the model selector strip.
+    juce::Label    modelLabel;
+    juce::ComboBox modelBox;
+    juce::Label    modelInfo;      // what the current choice costs
+
+    /** True when this build embedded more than one archive. A slim build has
+        nothing to choose between, so the row is hidden and the window shrinks
+        rather than offering a control that cannot change anything.
+    */
+    static bool hasAChoice();
+
+    /** Rebuilds the info line from the current selection. */
+    void updateModelInfo();
+
     DbMeter inputMeter { true };  // true = IN mode
     DbMeter outputMeter { false }; // false = OUT mode
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>   attenAttachment;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modelAttachment;
 
     double lastTimerSeconds = 0.0;   // for the real-dt meter ballistics
 

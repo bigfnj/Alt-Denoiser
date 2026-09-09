@@ -1465,6 +1465,55 @@ void testWrongFrameLengthIsRefused()
     record ("wrong frame length is refused", "M3", failures.empty(), Expect::Pass, detail);
 }
 
+void testModelKeepsUpWithRealtime (DfnModel which)
+{
+    // The realtime budget is one hop of wall time per hop of audio: 480 samples
+    // at 48 kHz is 10 ms. Exceed it and the worker cannot keep up, every block
+    // falls back to dry (M1), and the plugin silently stops denoising. A model
+    // that cannot meet that is not shippable, whatever else it does.
+    //
+    // This also produces the per-hop figure the editor and the README quote, so
+    // those numbers come from a measurement that runs on every gate rather than
+    // from something someone once benchmarked.
+
+    DeepFilterNetProcessor proc;
+    if (! proc.initialize (which))
+    {
+        record ("model keeps up with realtime" + modelTag (which), "7c", false, Expect::Pass,
+                "the model failed to load");
+        return;
+    }
+
+    const int hop = (int) proc.getFrameLength();
+    std::vector<float> in ((size_t) hop), out ((size_t) hop);
+
+    juce::Random rng (4242);
+    for (auto& v : in) v = 0.25f * (rng.nextFloat() * 2.0f - 1.0f);
+
+    // Warm up: the first frames allocate tract's scratch and populate its
+    // rolling buffers, so timing them measures startup rather than steady state.
+    for (int i = 0; i < 20; ++i) proc.processFrame (in.data(), out.data());
+
+    const int iterations = 200;
+    const double t0 = juce::Time::getMillisecondCounterHiRes();
+    for (int i = 0; i < iterations; ++i) proc.processFrame (in.data(), out.data());
+    const double elapsedMs = juce::Time::getMillisecondCounterHiRes() - t0;
+
+    const double msPerHop = elapsedMs / iterations;
+    const double budgetMs = 1000.0 * hop / 48000.0;      // 10 ms at hop 480
+    const double realtimeFactor = msPerHop / budgetMs;
+
+    // Half the budget, not all of it. At 100% the worker has exactly no margin
+    // for the OS scheduler, and a plugin is rarely the only thing running.
+    const bool passed = (realtimeFactor < 0.5);
+    record ("model keeps up with realtime" + modelTag (which), "7c", passed, Expect::Pass,
+            juce::String (msPerHop, 3).toStdString() + " ms per "
+              + std::to_string (hop) + "-sample hop against a "
+              + juce::String (budgetMs, 1).toStdString() + " ms budget, "
+              + juce::String (100.0 * realtimeFactor, 1).toStdString()
+              + "% of realtime (limit 50%)");
+}
+
 void testModelChoiceIsExposedAndDeferred()
 {
     // 7b. Three separate claims, each of which a user could be bitten by.
@@ -1547,6 +1596,90 @@ void testModelChoiceIsExposedAndDeferred()
         ? std::string ("exposed, non-automatable, defaults to the first embedded model, round-trips, applies only on prepare")
         : (std::to_string (failures.size()) + " failed: " + failures.front());
     record ("model choice is exposed and deferred", "7b", failures.empty(), Expect::Pass, detail);
+}
+
+void testEditorModelRow()
+{
+    // 7c. The editor is built headlessly here: no message loop runs, so paint()
+    // never fires (that is why the L1 meter test counts repaint REQUESTS), but
+    // construction, layout and parameter attachments all work, and those are
+    // what this checks.
+
+    std::vector<std::string> failures;
+    auto check = [&failures] (bool ok, const char* what)
+    {
+        if (! ok) failures.push_back (what);
+    };
+
+    AltDenoiserProcessor proc;
+    check (proc.hasEditor(), "the processor should have an editor");
+
+    std::unique_ptr<juce::AudioProcessorEditor> editor (proc.createEditor());
+    check (editor != nullptr, "createEditor should return an editor");
+    if (editor == nullptr)
+    {
+        record ("editor exposes the model row", "7c", false, Expect::Pass, "no editor");
+        return;
+    }
+
+    const bool bothEmbedded = DeepFilterNetProcessor::isModelAvailable (DfnModel::Standard)
+                           && DeepFilterNetProcessor::isModelAvailable (DfnModel::LowLatency);
+
+    // The window grew for the strip rather than the strip being squeezed into
+    // the existing layout, which had no room: at 460x320 the centre column is
+    // full from the title at 0..40 to the label at 275..295.
+    check (editor->getWidth() == 460, "the editor should still be 460 wide");
+    check (editor->getHeight() > 320, "the editor should have grown for the strip");
+    check (editor->getHeight() == (bothEmbedded ? 400 : 364),
+           "the editor height should match the strip it reserved");
+
+    // Find the ComboBox without reaching into private members.
+    juce::ComboBox* box = nullptr;
+    for (auto* child : editor->getChildren())
+        if (auto* c = dynamic_cast<juce::ComboBox*> (child))
+            box = c;
+
+    if (! bothEmbedded)
+    {
+        check (box == nullptr, "a slim build should not show a selector");
+    }
+    else
+    {
+        check (box != nullptr, "the model selector should be present");
+
+        if (box != nullptr)
+        {
+            check (box->getNumItems() == kNumDfnModels, "the selector should list every model");
+
+            // Parameter -> box. A host or a session restore moves the parameter,
+            // and the box has to follow or the UI lies about what will load.
+            setModel (proc, DfnModel::LowLatency);
+            check (box->getSelectedItemIndex() == (int) DfnModel::LowLatency,
+                   "the box should follow the parameter");
+
+            // Box -> parameter. Without the attachment the control would look
+            // like it worked and change nothing.
+            box->setSelectedItemIndex ((int) DfnModel::Standard, juce::sendNotificationSync);
+            auto* choice = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("model"));
+            check (choice != nullptr && choice->getIndex() == (int) DfnModel::Standard,
+                   "the parameter should follow the box");
+
+            // The strip must not land on top of the meters, which span the full
+            // height of the area above it.
+            for (auto* child : editor->getChildren())
+                if (auto* meter = dynamic_cast<DbMeter*> (child))
+                    check (! meter->getBounds().intersects (box->getBounds()),
+                           "the selector must not overlap a meter");
+        }
+    }
+
+    const std::string detail = failures.empty()
+        ? (std::string ("editor ") + std::to_string (editor->getWidth()) + "x"
+             + std::to_string (editor->getHeight())
+             + (bothEmbedded ? ", selector present and attached both ways"
+                             : ", slim build hides the selector"))
+        : (std::to_string (failures.size()) + " failed: " + failures.front());
+    record ("editor exposes the model row", "7c", failures.empty(), Expect::Pass, detail);
 }
 
 //==============================================================================
@@ -1737,8 +1870,10 @@ int main (int argc, char** argv)
         testModelMetadataIsReported (which);
         testLatencyIsDerivedFromTheModel (which);
         testDryAndWetArriveTogether (which);
+        testModelKeepsUpWithRealtime (which);
     }
     testModelChoiceIsExposedAndDeferred();
+    testEditorModelRow();
     testWrongFrameLengthIsRefused();
 
     int unexpected = 0;
