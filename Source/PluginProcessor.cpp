@@ -40,7 +40,18 @@ juce::AudioProcessorValueTreeState::ParameterLayout AltDenoiserProcessor::create
 }
 
 void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
-    // Build the model first: everything below is sized from what it reports.
+    // MUST come first. initialize() below calls df_free on the live DFState (H1),
+    // and on a re-prepare the worker from the previous configuration is still
+    // running and may be inside processFrame on that exact pointer: a
+    // use-after-free.
+    //
+    // H1 and M1 were each safe in isolation. H1 introduced the df_free when no
+    // worker existed; M1 introduced the worker when nothing freed the state.
+    // Together they opened this window. releaseResources() already had the
+    // right order, which is why the leak-and-teardown path never showed it.
+    worker.stop();
+
+    // Build the model: everything below is sized from what it reports.
     const bool loaded = dfProcessor->initialize();
 
     // M3: take the hop size from the model rather than assuming 480. Every

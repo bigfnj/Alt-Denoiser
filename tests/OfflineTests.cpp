@@ -505,6 +505,61 @@ void testRealtimeFallbackIsDryNotSilence()
               + ", last at " + std::to_string (lastZero));
 }
 
+//==============================================================================
+// T9 / N2 - re-preparing while the worker is busy must not free the model from
+// under it.
+//
+// initialize() calls df_free on the live DFState (H1). If the worker from the
+// previous configuration is still running, it may be inside processFrame on that
+// exact pointer. Realtime mode is used deliberately: the offline path waits for
+// the worker and drains the queue, which hides the window entirely.
+
+void testReprepareWhileWorkerBusy()
+{
+    AltDenoiserProcessor proc;
+    double lastPeak = 0.0;
+
+    for (int round = 0; round < 12; ++round)
+    {
+        proc.setNonRealtime (false);            // do not drain; let frames pile up
+        proc.setPlayConfigDetails (2, 2, kSampleRate, kBlockSize);
+        proc.prepareToPlay (kSampleRate, kBlockSize);
+        setAttenuation (proc, 0.0f);
+
+        // Enough blocks to fill the worker's inbound queue, few enough that it
+        // cannot have drained it.
+        render (proc, 6,
+                [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+                [&lastPeak] (const juce::AudioBuffer<float>& b, int)
+                {
+                    for (int i = 0; i < b.getNumSamples(); ++i)
+                        lastPeak = std::max (lastPeak, (double) std::abs (b.getSample (0, i)));
+                });
+        // Next loop iteration re-prepares immediately, with work still in flight.
+    }
+
+    // Surviving is most of the assertion; under ASAN the use-after-free aborts
+    // here rather than passing. Also confirm the plugin still works afterwards.
+    proc.setNonRealtime (true);
+    prepare (proc);
+    setAttenuation (proc, 0.0f);
+    double afterPeak = 0.0;
+    render (proc, 30,
+            [] (juce::AudioBuffer<float>& b, int blk) { fillSine (b, blk, 440.0f, 440.0f); },
+            [&afterPeak] (const juce::AudioBuffer<float>& b, int blk)
+            {
+                if (blk < 15) return;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                    afterPeak = std::max (afterPeak, (double) std::abs (b.getSample (0, i)));
+            });
+
+    const bool passed = (afterPeak > 0.1);
+    record ("re-prepare while worker busy", "N2", passed, Expect::Pass,
+            "survived 12 re-prepares with work in flight, peak during " + std::to_string (lastPeak)
+              + ", peak after " + std::to_string (afterPeak)
+              + " (build with -fsanitize=address to turn the race into an abort)");
+}
+
 } // namespace
 
 //==============================================================================
@@ -526,6 +581,7 @@ int main (int argc, char** argv)
     testUnpreparedPassesAudioThrough();
     testResetDropsStaleAudio();
     testRealtimeFallbackIsDryNotSilence();
+    testReprepareWhileWorkerBusy();
 
     int unexpected = 0;
     for (const auto& r : results)
