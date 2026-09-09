@@ -4,6 +4,7 @@
 #include "DeepFilterNetProcessor.h"
 #include "Resampler.hpp"
 #include <algorithm>
+#include <atomic>
 #include <vector>
 #include <memory>
 
@@ -119,7 +120,11 @@ private:
     SimpleFifo outputFifo;
     std::vector<float> tempInputFrame;
     std::vector<float> tempOutputFrame;
-    bool modelLoaded = false;
+    // H3: written from the prepareToPlay thread and read from the audio thread.
+    // A plain bool here is a data race; the underlying DFState pointer has the
+    // same problem and is only fully resolved by moving inference to a worker
+    // that owns it exclusively (M1).
+    std::atomic<bool> modelLoaded { false };
     float lastAttenLim = -1.0f;   // sentinel: forces the first block to apply the real value
     int preparedBlockSize = 0;    // C5: what the resample buffers were sized for
 

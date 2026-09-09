@@ -41,7 +41,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout AltDenoiserProcessor::create
 
 void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock) {
     // Build the model first: everything below is sized from what it reports.
-    modelLoaded = dfProcessor->initialize();
+    const bool loaded = dfProcessor->initialize();
 
     // M3: take the hop size from the model rather than assuming 480. Every
     // archive libDF can load uses 480 today, but df_process_frame builds its
@@ -49,11 +49,12 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     // only guard inside libDF is a debug_assert compiled out in release. A
     // mismatch would therefore be a silent heap overrun, not a clean failure.
     const size_t reportedHop = dfProcessor->getFrameLength();
-    if (modelLoaded && (reportedHop == 0 || reportedHop > 4096)) {
+    const bool hopIsSane = (reportedHop > 0 && reportedHop <= 4096);
+    if (loaded && ! hopIsSane)
         DBG("Model reports an unusable hop size; bypassing");
-        modelLoaded = false;
-    }
-    modelFrameLength = modelLoaded ? (int) reportedHop : 480;
+
+    const bool usable = loaded && hopIsSane;
+    modelFrameLength = usable ? (int) reportedHop : 480;
 
     tempInputFrame.assign((size_t) modelFrameLength, 0.0f);
     tempOutputFrame.assign((size_t) modelFrameLength, 0.0f);
@@ -104,6 +105,11 @@ void AltDenoiserProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
     resampleInBuffer.resize(maxResampledSize);
     resampleOutBuffer.resize(maxResampledSize);
     monoBuffer.assign((size_t) samplesPerBlock, 0.0f);
+
+    // H3: published LAST, with release ordering, after every buffer and FIFO it
+    // guards has been sized. The audio thread acquires it in processBlock, so it
+    // can never observe modelLoaded == true against half-built geometry.
+    modelLoaded.store(usable, std::memory_order_release);
 }
 
 bool AltDenoiserProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const
@@ -170,7 +176,8 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // simply not denoise. The meters are still updated below so the UI shows
     // signal arriving and leaving, instead of freezing at their last values and
     // making a silent plugin look healthy.
-    const bool modelAvailable = modelLoaded && dfProcessor != nullptr && dfProcessor->isReady();
+    const bool modelAvailable = modelLoaded.load(std::memory_order_acquire)
+                                && dfProcessor != nullptr && dfProcessor->isReady();
 
     // C5: the resample buffers were sized from the samplesPerBlock the host
     // declared in prepareToPlay. A host that then delivers a larger block would
