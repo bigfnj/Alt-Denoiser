@@ -89,7 +89,13 @@ juce_add_binary_data(AltDenoiserAssets
 # VST2 removed: Steinberg stopped issuing VST2 SDK licences in October 2018, so
 # distributing VST2 builds is a legal risk regardless of whether they compile.
 # The SDK was previously supplied by a third-party mirror submodule.
-set(PLUGIN_FORMATS VST3 Standalone)
+#
+# Standalone removed: it is not distributed. It cost build time on all three CI
+# platforms and produced a ~29 MB artefact (BACKLOG.md PKG1) that no release
+# ever shipped, so nothing downstream consumed it.
+#
+# What ships: VST3 everywhere, AU on macOS, LV2 on Linux.
+set(PLUGIN_FORMATS VST3)
 if(APPLE)
     list(APPEND PLUGIN_FORMATS AU)
 elseif(UNIX AND NOT APPLE)
