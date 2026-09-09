@@ -110,8 +110,43 @@ public:
         }
     }
 
-    std::atomic<float> inputRmsLevel { 0.0f };
-    std::atomic<float> outputRmsLevel { 0.0f };
+    /** Running peak that the editor consumes and resets.
+
+        M10/L4: the previous scheme applied a one-pole EMA to channel 0's RMS
+        once per block, so the time constant swung 32x with buffer size (1.9 ms
+        at 64 samples, 61.6 ms at 2048) and at small buffers roughly 92% of
+        blocks were never observed by the 60 Hz UI. A running max drops nothing
+        at any buffer size, because the UI's window is exactly one frame.
+
+        Peak rather than RMS is also what makes the meter scale honest: it is
+        drawn with a red band above 0 dBFS that an RMS value can never reach,
+        since a full-scale sine is -3.01 dB RMS.
+    */
+    class PeakProbe
+    {
+    public:
+        /** Audio thread. */
+        void push(float blockPeak) noexcept
+        {
+            float prev = value.load(std::memory_order_relaxed);
+            // CAS rather than load/store: the UI consumer can exchange between
+            // a plain read and write, which would silently drop a peak.
+            while (blockPeak > prev
+                   && ! value.compare_exchange_weak(prev, blockPeak,
+                                                    std::memory_order_relaxed))
+            {
+            }
+        }
+
+        /** UI thread. Returns the peak since the last call and clears it. */
+        float takeAndReset() noexcept { return value.exchange(0.0f, std::memory_order_acquire); }
+
+    private:
+        std::atomic<float> value { 0.0f };
+    };
+
+    PeakProbe inputLevel;
+    PeakProbe outputLevel;
     juce::AudioProcessorValueTreeState apvts;
 
 private:

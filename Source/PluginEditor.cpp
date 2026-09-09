@@ -88,9 +88,15 @@ void AltDenoiserEditor::resized()
 
 void AltDenoiserEditor::timerCallback()
 {
-    float rawIn = audioProcessor.inputRmsLevel.load();
-    float rawOut = audioProcessor.outputRmsLevel.load();
+    // M9: measure the interval rather than assuming 1/60 s. JUCE documents the
+    // timer as imprecise to 10-20 ms, which at a 16.7 ms nominal interval is
+    // 60-120% of the interval itself.
+    const double now = juce::Time::getMillisecondCounterHiRes() * 0.001;
+    const double dt = (lastTimerSeconds > 0.0) ? (now - lastTimerSeconds) : 0.0;
+    lastTimerSeconds = now;
 
-    inputMeter.update(rawIn);
-    outputMeter.update(rawOut);
+    // takeAndReset, not load: the probe holds a running peak, so consuming it
+    // is what makes the UI window exactly one frame with nothing dropped.
+    inputMeter.update(audioProcessor.inputLevel.takeAndReset(), dt);
+    outputMeter.update(audioProcessor.outputLevel.takeAndReset(), dt);
 }

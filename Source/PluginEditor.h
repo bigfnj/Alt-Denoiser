@@ -2,6 +2,7 @@
 
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
+#include <vector>
 #include "PluginProcessor.h"
 
 class ModernLookAndFeel : public juce::LookAndFeel_V4
@@ -45,142 +46,213 @@ public:
     }
 };
 
+/** Sample-peak meter with frame-rate-independent ballistics.
+
+    Replaces a design that decayed by a fixed factor per timer tick. That was
+    -1.94 dB per tick, so -116 dB/s at 60 Hz, five to ten times faster than any
+    metering standard, on a timer JUCE documents as imprecise to 10-20 ms at
+    exactly this interval (M9). The bar and the numeric readout also decayed at
+    different rates from separate state, so they disagreed after every transient
+    (M11), and the readout decremented without a floor (L3).
+
+    Now one attack event feeds two values in the dB domain. levelDb drives the
+    bar and falls at a standard rate; holdDb is a peak hold that drives the
+    readout and falls at the same rate once its hold expires. The invariant
+    holdDb >= levelDb therefore always holds, and the two converge.
+*/
 class DbMeter : public juce::Component
 {
 public:
-    DbMeter(bool isInputMode) : isInput(isInputMode) {}
-    void update(float newRawLevel) 
-    {
-        const float attack = 1.0f;
-        const float release = 0.8f;
-        
-        if (newRawLevel > smoothedLevel) smoothedLevel = newRawLevel; // Attack
-        else smoothedLevel *= release;                                // Release
-        
-        if (smoothedLevel < 1e-9f) smoothedLevel = 1e-9f;
+    explicit DbMeter(bool isInputMode)
+        : isInput(isInputMode), caption(isInputMode ? "IN" : "OUT") {}
 
-        float currentDb = juce::Decibels::gainToDecibels(smoothedLevel, -100.0f);
-        
-        if (currentDb > displayedDb) {
-            displayedDb = currentDb; 
-        } else {
-            displayedDb -= 0.5f;
+    static constexpr float kFloorDb      = -100.0f;
+    static constexpr float kMinDb        =  -60.0f;  // bottom of the drawn scale
+    static constexpr float kMaxDb        =    6.0f;  // top of the drawn scale
+    static constexpr float kFallDbPerSec =   20.0f;  // standard digital peak meter
+    static constexpr double kHoldSeconds =    1.5;
+
+    /** @param newPeak    linear sample peak since the last call, 0 if none
+        @param dtSeconds  real elapsed time, not an assumed frame interval
+    */
+    void update(float newPeak, double dtSeconds)
+    {
+        // Clamped so a stalled message thread or a debugger pause cannot slam
+        // the meter to the floor in a single step.
+        const float dt = (float) juce::jlimit(0.0, 0.2, dtSeconds);
+        const float fall = kFallDbPerSec * dt;
+
+        levelDb = juce::jmax(kFloorDb, levelDb - fall);   // L3: clamped, not unbounded
+
+        if (holdRemaining > 0.0f) holdRemaining -= dt;
+        else                      holdDb = juce::jmax(kFloorDb, holdDb - fall);
+
+        if (newPeak > 0.0f)
+        {
+            const float peakDb = juce::Decibels::gainToDecibels(newPeak, kFloorDb);
+            if (peakDb > levelDb) levelDb = peakDb;              // instantaneous attack
+            if (peakDb > holdDb) { holdDb = peakDb; holdRemaining = (float) kHoldSeconds; }
         }
 
-        repaint();
+        holdDb = juce::jmax(holdDb, levelDb);    // M11: the invariant, made explicit
+
+        // L1: repaint only when the rendered result actually differs. In silence
+        // both values are pinned at the floor, so the repaint count drops to zero
+        // rather than redrawing an identical image 60 times a second forever.
+        const int newBarY = juce::roundToInt(mapDbToY(levelDb));
+        const juce::String newReadout = (holdDb <= -90.0f) ? juce::String("-inf")
+                                                           : juce::String(holdDb, 1);
+        if (newBarY != paintedBarY || newReadout != paintedReadout)
+        {
+            paintedBarY = newBarY;
+            paintedReadout = newReadout;
+            ++repaintRequests;
+            repaint();
+        }
+    }
+
+    // Test accessors.
+    float getLevelDb() const noexcept { return levelDb; }
+    float getHoldDb()  const noexcept { return holdDb; }
+    int   getPaintCount() const noexcept { return paintCount; }
+
+    /** Counts repaint REQUESTS, not paints.
+
+        A headless test never pumps a message loop, so paint() is never invoked
+        and a paint counter cannot move whether the gate works or not. Counting
+        the decision is the only thing an offline test can actually assert.
+    */
+    int   getRepaintRequests() const noexcept { return repaintRequests; }
+
+    void resized() override
+    {
+        // L2: everything static for a given size is built here rather than
+        // rebuilt every frame. paint() previously constructed a Path, a
+        // ColourGradient and six Strings per meter per frame, roughly 1000
+        // allocations a second across the two meters.
+        auto bounds = getLocalBounds().toFloat();
+        auto meterArea = bounds.withTrimmedTop(kTopTextHeight)
+                               .withTrimmedBottom(kBottomTextHeight)
+                               .reduced(14.0f, 0);
+
+        if (isInput) { barRect = meterArea.removeFromLeft(12.0f);  tickArea = meterArea.withTrimmedLeft(6.0f); }
+        else         { barRect = meterArea.removeFromRight(12.0f); tickArea = meterArea.withTrimmedRight(6.0f); }
+
+        clipPath.clear();
+        clipPath.addRoundedRectangle(barRect, 2.0f);
+
+        y0dB       = mapDbToY(0.0f);
+        yMinus6dB  = mapDbToY(-6.0f);
+        yMinus24dB = mapDbToY(-24.0f);
+
+        gradient = juce::ColourGradient(juce::Colours::yellow, 0, yMinus6dB,
+                                        juce::Colours::green,  0, yMinus24dB, false);
+
+        ticks.clear();
+        for (float t : { 0.0f, -6.0f, -12.0f, -24.0f, -48.0f })
+        {
+            const float y = mapDbToY(t);
+            if (y >= barRect.getY() && y <= barRect.getBottom())
+                ticks.push_back({ y, juce::String((int) t) });
+        }
+
+        topTextRect = juce::Rectangle<float>(0, 0, 60, kTopTextHeight)
+                        .withCentre({ barRect.getCentreX(), kTopTextHeight * 0.5f });
+        botTextRect = juce::Rectangle<float>(0, 0, 60, kBottomTextHeight)
+                        .withCentre({ barRect.getCentreX(), bounds.getBottom() - kBottomTextHeight * 0.5f });
+
+        paintedBarY = juce::roundToInt(mapDbToY(levelDb));
     }
 
     void paint(juce::Graphics& g) override
     {
-        auto bounds = getLocalBounds().toFloat();
-        
-        const float topTextHeight = 18.0f;
-        const float bottomTextHeight = 18.0f;
-        const float internalPadding = 14.0f; 
-
-        auto meterArea = bounds.withTrimmedTop(topTextHeight)
-                               .withTrimmedBottom(bottomTextHeight)
-                               .reduced(internalPadding, 0);
-
-        const float barWidth = 12.0f;
-        juce::Rectangle<float> barRect;
-        juce::Rectangle<float> tickArea;
-
-        if (isInput) {
-            barRect = meterArea.removeFromLeft(barWidth);
-            tickArea = meterArea.withTrimmedLeft(6.0f);
-        } else {
-            barRect = meterArea.removeFromRight(barWidth);
-            tickArea = meterArea.withTrimmedRight(6.0f);
-        }
+        ++paintCount;
 
         g.setColour(juce::Colour(0xff181818));
         g.fillRoundedRectangle(barRect, 2.0f);
 
-        float db = juce::Decibels::gainToDecibels(smoothedLevel, -100.0f);
-
-        const float maxdB = 6.0f;
-        const float mindB = -60.0f;
-
-        auto mapDbToY = [&](float val) {
-            return juce::jmap(val, mindB, maxdB, barRect.getBottom(), barRect.getY());
-        };
-
-        float y0dB      = mapDbToY(0.0f);
-        float yMinus6dB = mapDbToY(-6.0f);
-        float yMinus24dB= mapDbToY(-24.0f);
-        float yBottom   = barRect.getBottom();
-    
-        float yCurrent  = juce::jlimit(barRect.getY(), yBottom, mapDbToY(db));
+        const float yBottom  = barRect.getBottom();
+        const float yCurrent = juce::jlimit(barRect.getY(), yBottom, mapDbToY(levelDb));
 
         g.saveState();
-        juce::Path clipPath;
-        clipPath.addRoundedRectangle(barRect, 2.0f);
         g.reduceClipRegion(clipPath);
 
-        float greenTop = juce::jmax(yCurrent, yMinus24dB);
-        if (greenTop < yBottom) {
+        const float greenTop = juce::jmax(yCurrent, yMinus24dB);
+        if (greenTop < yBottom)
+        {
             g.setColour(juce::Colours::green);
             g.fillRect(barRect.withTop(greenTop).withBottom(yBottom));
         }
-        float gradTop = juce::jmax(yCurrent, yMinus6dB);
-        if (gradTop < yMinus24dB) {
-            juce::ColourGradient gradient(
-                juce::Colours::yellow, 0, yMinus6dB,
-                juce::Colours::green,  0, yMinus24dB, 
-                false
-            );
+        const float gradTop = juce::jmax(yCurrent, yMinus6dB);
+        if (gradTop < yMinus24dB)
+        {
             g.setGradientFill(gradient);
             g.fillRect(barRect.withTop(gradTop).withBottom(yMinus24dB));
         }
-        float yellowTop = juce::jmax(yCurrent, y0dB);
-        if (yellowTop < yMinus6dB) {
+        const float yellowTop = juce::jmax(yCurrent, y0dB);
+        if (yellowTop < yMinus6dB)
+        {
             g.setColour(juce::Colours::yellow);
             g.fillRect(barRect.withTop(yellowTop).withBottom(yMinus6dB));
         }
-        if (yCurrent < y0dB) {
+        if (yCurrent < y0dB)
+        {
+            // Reachable now that the source is sample peak rather than RMS. A
+            // full-scale sine is -3.01 dB RMS and could never light this (L4).
             g.setColour(juce::Colours::red);
             g.fillRect(barRect.withTop(yCurrent).withBottom(y0dB));
         }
-
         g.restoreState();
 
-        float barCenterX = barRect.getCentreX();
-        // top:dB
         g.setColour(juce::Colours::white);
         g.setFont(juce::FontOptions(12.0f));
-        juce::String peakStr = (displayedDb <= -90.0f) ? "-inf" : juce::String(displayedDb, 1);
-        juce::Rectangle<float> topTextRect(0, 0, 60, topTextHeight);
-        topTextRect.setCentre(barCenterX, topTextHeight / 2.0f);
-        g.drawFittedText(peakStr, topTextRect.toNearestInt(), juce::Justification::centred, 1);
+        g.drawFittedText(paintedReadout, topTextRect.toNearestInt(), juce::Justification::centred, 1);
 
-        // bottom:IN/OUT
         g.setFont(juce::FontOptions(10.0f));
         g.setColour(juce::Colours::grey);
-        juce::Rectangle<float> botTextRect(0, bounds.getBottom() - bottomTextHeight, 60, bottomTextHeight);
-        botTextRect.setCentre(barCenterX, bounds.getBottom() - bottomTextHeight / 2.0f);
-        g.drawFittedText(isInput ? "IN" : "OUT", botTextRect.toNearestInt(), juce::Justification::centred, 1);
+        g.drawFittedText(caption, botTextRect.toNearestInt(), juce::Justification::centred, 1);
 
-        // meter ticks
-        g.setFont(juce::FontOptions(10.0f));
-        const float ticks[] = { 0.0f, -6.0f, -12.0f, -24.0f, -48.0f };
-        for (float t : ticks) {
-            float y = mapDbToY(t);
-            if (y >= barRect.getY() && y <= barRect.getBottom()) {
-                g.setColour(juce::Colours::white.withAlpha(0.3f));
-                g.fillRect(barRect.getX(), y, barRect.getWidth(), 1.0f);
-                g.setColour(juce::Colours::grey);
-                juce::Justification just = isInput ? juce::Justification::centredLeft : juce::Justification::centredRight;
-                auto numRect = tickArea.withY(y - 5.0f).withHeight(10.0f);
-                g.drawText(juce::String((int)t), numRect, just, false);
-            }
+        const auto just = isInput ? juce::Justification::centredLeft : juce::Justification::centredRight;
+        for (const auto& tick : ticks)
+        {
+            g.setColour(juce::Colours::white.withAlpha(0.3f));
+            g.fillRect(barRect.getX(), tick.y, barRect.getWidth(), 1.0f);
+            g.setColour(juce::Colours::grey);
+            g.drawText(tick.label, tickArea.withY(tick.y - 5.0f).withHeight(10.0f), just, false);
         }
     }
 
 private:
-    float smoothedLevel = 0.0f;
-    float displayedDb = -100.0f;
-    bool isInput;
+    struct Tick { float y; juce::String label; };
+
+    static constexpr float kTopTextHeight    = 18.0f;
+    static constexpr float kBottomTextHeight = 18.0f;
+
+    float mapDbToY(float db) const
+    {
+        return juce::jmap(db, kMinDb, kMaxDb, barRect.getBottom(), barRect.getY());
+    }
+
+    const bool isInput;
+    const juce::String caption;
+
+    float levelDb = kFloorDb;
+    float holdDb = kFloorDb;
+    float holdRemaining = 0.0f;
+
+    // Precomputed in resized().
+    juce::Rectangle<float> barRect, tickArea, topTextRect, botTextRect;
+    juce::Path clipPath;
+    juce::ColourGradient gradient;
+    std::vector<Tick> ticks;
+    float y0dB = 0.0f, yMinus6dB = 0.0f, yMinus24dB = 0.0f;
+
+    int paintedBarY = -1;
+    juce::String paintedReadout;
+    int paintCount = 0;
+    int repaintRequests = 0;
+
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(DbMeter)
 };
 
 class AltDenoiserEditor : public juce::AudioProcessorEditor, public juce::Timer
@@ -207,6 +279,8 @@ private:
     DbMeter outputMeter { false }; // false = OUT mode
 
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attenAttachment;
+
+    double lastTimerSeconds = 0.0;   // for the real-dt meter ballistics
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AltDenoiserEditor)
 };

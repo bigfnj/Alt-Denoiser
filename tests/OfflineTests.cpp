@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "PluginProcessor.h"
+#include "PluginEditor.h"
 
 namespace
 {
@@ -560,6 +561,119 @@ void testReprepareWhileWorkerBusy()
               + " (build with -fsanitize=address to turn the race into an abort)");
 }
 
+//==============================================================================
+// T10-T13 / M9, M10, M11, L1, L3, L4 - meter behaviour.
+//
+// DbMeter is a plain juce::Component and the harness already installs a
+// ScopedJuceInitialiser_GUI, so it can be driven directly with no editor.
+
+void testMeterDecayIsFrameRateIndependent()
+{
+    // The same wall-clock second at two frame rates must reach the same level.
+    // The old code multiplied by a fixed factor per tick, so 60 ticks and 30
+    // ticks of the same duration disagreed by tens of dB (M9).
+    DbMeter fast { true }, slow { true };
+    fast.setSize (70, 240);
+    slow.setSize (70, 240);
+
+    fast.update (1.0f, 0.0);
+    slow.update (1.0f, 0.0);
+
+    for (int i = 0; i < 60; ++i) fast.update (0.0f, 1.0 / 60.0);
+    for (int i = 0; i < 30; ++i) slow.update (0.0f, 1.0 / 30.0);
+
+    const double diff = std::abs (fast.getLevelDb() - slow.getLevelDb());
+    const bool passed = (diff < 0.5);
+    record ("meter decay is frame-rate independent", "M9", passed, Expect::Pass,
+            "after 1 s: 60 Hz -> " + std::to_string (fast.getLevelDb())
+              + " dB, 30 Hz -> " + std::to_string (slow.getLevelDb())
+              + " dB, difference " + std::to_string (diff) + " dB");
+}
+
+void testMeterDecayRateIsStandard()
+{
+    // A digital peak meter falls about 20 dB/s. The old code fell 116 dB/s.
+    DbMeter m { true };
+    m.setSize (70, 240);
+    m.update (1.0f, 0.0);
+    const float start = m.getLevelDb();
+    for (int i = 0; i < 60; ++i) m.update (0.0f, 1.0 / 60.0);
+    const float fell = start - m.getLevelDb();
+
+    const bool passed = (fell > 19.0f && fell < 21.0f);
+    record ("meter decay rate is standard", "M9", passed, Expect::Pass,
+            "fell " + std::to_string (fell) + " dB in 1 s (target 20, old code 116)");
+}
+
+void testMeterHoldNeverDropsBelowBar()
+{
+    // M11: bar and readout used to decay from separate state at different rates,
+    // so they disagreed after every transient. L3: the readout also had no floor
+    // and decremented without bound, reaching about -108,000 after an hour.
+    DbMeter m { true };
+    m.setSize (70, 240);
+
+    bool invariantHeld = true;
+    m.update (1.0f, 0.0);
+    for (int i = 0; i < 600; ++i)          // 10 s of silence
+    {
+        m.update (0.0f, 1.0 / 60.0);
+        if (m.getHoldDb() < m.getLevelDb() - 1.0e-3f) invariantHeld = false;
+    }
+
+    const bool floored = (m.getLevelDb() >= DbMeter::kFloorDb - 1.0e-3f)
+                      && (m.getHoldDb()  >= DbMeter::kFloorDb - 1.0e-3f);
+    const bool passed = invariantHeld && floored;
+    record ("meter hold tracks bar and both floor", "M11/L3", passed, Expect::Pass,
+            "after 10 s silence: level " + std::to_string (m.getLevelDb())
+              + " dB, hold " + std::to_string (m.getHoldDb())
+              + " dB, floor " + std::to_string (DbMeter::kFloorDb)
+              + (invariantHeld ? "" : ", INVARIANT VIOLATED"));
+}
+
+void testMeterRepaintsOnlyOnChange()
+{
+    // L1: repaint() was unconditional, so two meters fully repainted 60 times a
+    // second forever, including in total silence with an identical result.
+    DbMeter m { true };
+    m.setSize (70, 240);
+
+    for (int i = 0; i < 200; ++i) m.update (0.0f, 1.0 / 60.0);   // settle to floor
+    const int before = m.getRepaintRequests();
+    for (int i = 0; i < 120; ++i) m.update (0.0f, 1.0 / 60.0);   // 2 s more silence
+    const int during = m.getRepaintRequests() - before;
+
+    // Counts repaint REQUESTS. An earlier version of this test counted paint()
+    // calls and was vacuous: headless, paint() never runs, so the counter stayed
+    // at zero whether the gate worked or not. It passed against a mutation that
+    // made repaint() unconditional, which is exactly what it exists to catch.
+    const bool passed = (during == 0);
+    record ("meter repaints only on change", "L1", passed, Expect::Pass,
+            "repaints during 120 silent updates: " + std::to_string (during));
+}
+
+void testMetersSeeAllChannels()
+{
+    // L4: only channel 0 was metered, so a right-channel-only source read as
+    // silence on the input meter.
+    AltDenoiserProcessor proc;
+    prepare (proc);
+    setAttenuation (proc, 0.0f);
+
+    render (proc, 20,
+            [] (juce::AudioBuffer<float>& b, int blk)
+            {
+                fillSine (b, blk, 440.0f, 440.0f);
+                b.clear (0, 0, b.getNumSamples());     // silence on the LEFT
+            },
+            [] (const juce::AudioBuffer<float>&, int) {});
+
+    const float seen = proc.inputLevel.takeAndReset();
+    const bool passed = (seen > 0.1f);
+    record ("meters see all channels", "L4", passed, Expect::Pass,
+            "right-channel-only input, meter saw peak " + std::to_string (seen));
+}
+
 } // namespace
 
 //==============================================================================
@@ -582,6 +696,11 @@ int main (int argc, char** argv)
     testResetDropsStaleAudio();
     testRealtimeFallbackIsDryNotSilence();
     testReprepareWhileWorkerBusy();
+    testMeterDecayIsFrameRateIndependent();
+    testMeterDecayRateIsStandard();
+    testMeterHoldNeverDropsBelowBar();
+    testMeterRepaintsOnlyOnChange();
+    testMetersSeeAllChannels();
 
     int unexpected = 0;
     for (const auto& r : results)

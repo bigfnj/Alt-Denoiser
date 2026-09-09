@@ -233,6 +233,13 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     const bool modelAvailable = modelLoaded.load(std::memory_order_acquire)
                                 && dfProcessor != nullptr && dfProcessor->isReady();
 
+    // M10/L4: sample peak across ALL input channels, held until the editor
+    // consumes it. AudioBuffer::getMagnitude(start, num) scans every channel, so
+    // a right-channel-only source no longer reads as silence on the input meter.
+    // Pushed before the guard below, so a refused block still shows signal.
+    if (totalNumInputChannels > 0)
+        inputLevel.push(buffer.getMagnitude(0, buffer.getNumSamples()));
+
     // C5: the resample buffers were sized from the samplesPerBlock the host
     // declared in prepareToPlay. A host that then delivers a larger block would
     // make the resampler write past the end of those vectors: preparing for 128
@@ -242,16 +249,11 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
     // through untouched rather than corrupting the heap.
     if (buffer.getNumSamples() > preparedBlockSize) {
         jassertfalse;
+        // Passing through untouched, so what leaves equals what arrived.
+        if (totalNumOutputChannels > 0)
+            outputLevel.push(buffer.getMagnitude(0, buffer.getNumSamples()));
         return;
     }
- 
-    // input rms
-    const float smoothAlpha = 0.5f; // smoothing factor for RMS
-    float currentInRMS = 0.0f;
-    if (totalNumInputChannels > 0)
-        currentInRMS = buffer.getRMSLevel(0, 0, buffer.getNumSamples());
-    float oldIn = inputRmsLevel.load();
-    inputRmsLevel.store(oldIn * (1.0f - smoothAlpha) + currentInRMS * smoothAlpha);
 
     // clear and parameter update
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)
@@ -376,12 +378,10 @@ void AltDenoiserProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::
         juce::FloatVectorOperations::copy(buffer.getWritePointer(ch), monoBuffer.data(), hostNumSamples);
   }   // if (modelAvailable); otherwise the buffer passes through untouched
 
-    // output RMS
-    float currentOutRMS = 0.0f;
+    // Measured after processing (or after the H7 bypass), so the meter reflects
+    // what actually leaves the plugin.
     if (totalNumOutputChannels > 0)
-        currentOutRMS = buffer.getRMSLevel(0, 0, buffer.getNumSamples());        
-    float oldOut = outputRmsLevel.load();
-    outputRmsLevel.store(oldOut * (1.0f - smoothAlpha) + currentOutRMS * smoothAlpha);
+        outputLevel.push(buffer.getMagnitude(0, buffer.getNumSamples()));
 }
 
 juce::AudioProcessorEditor* AltDenoiserProcessor::createEditor() {return new AltDenoiserEditor(*this, apvts);}
