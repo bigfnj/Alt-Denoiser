@@ -15,33 +15,55 @@ endif()
 set(JUCE_DIR          ${CMAKE_SOURCE_DIR}/modules/JUCE)
 set(RESAMPLER_DIR     ${CMAKE_SOURCE_DIR}/modules/Resampler)
 set(DFNET_DIR         ${CMAKE_SOURCE_DIR}/modules/DeepFilterNet)
-set(LIBDF_CARGO_DIR   ${DFNET_DIR}/libDF)
-set(TARGET_RELEASE_DIR ${DFNET_DIR}/target/release)
 set(LIBS_DIR          ${CMAKE_SOURCE_DIR}/libs)
-set(LIBS_INCLUDE_DIR  ${LIBS_DIR}/Include) # df.h
+set(LIBS_INCLUDE_DIR  ${LIBS_DIR}/Include) # alt_df.h
+set(ALT_DF_DIR        ${LIBS_DIR}/alt_df)
+set(TARGET_RELEASE_DIR ${ALT_DF_DIR}/target/release)
 
 find_program(CARGO_CMD cargo REQUIRED)
 if(WIN32)
-    set(RUST_LIB_NAME "df.lib")
+    set(RUST_LIB_NAME "alt_df.lib")
 else()
-    set(RUST_LIB_NAME "libdf.a")
+    set(RUST_LIB_NAME "libalt_df.a")
 endif()
 
-add_custom_target(build_libdf ALL
-    COMMAND ${CARGO_CMD} build --release --manifest-path ${LIBDF_CARGO_DIR}/Cargo.toml --features capi
-    WORKING_DIRECTORY ${LIBDF_CARGO_DIR}
+# We build our own shim crate instead of libDF's `capi` feature. Two reasons.
+#
+# Correctness: libDF's C API cannot report failure. df_create returned a Box and
+# never NULL, and both it and df_process_frame ended in .expect(), so a corrupt
+# model archive panicked across extern "C" and aborted the host (BACKLOG.md
+# C1/C2). libs/alt_df returns a status from every entry point.
+#
+# Size: `capi` transitively enables `default-model`, which compiles an entire
+# DeepFilterNet3 archive into the static library on top of the copy the plugin
+# already carries as JUCE BinaryData. alt_df sets default-features = false.
+#
+# It REPLACES rather than joins libDF here. Linking both staticlibs would put
+# two copies of libstd on the link line, which MSVC reports as LNK4006/LNK2005.
+#
+# --target-dir is passed explicitly rather than relying on the default. Without
+# it, a CARGO_TARGET_DIR in the environment or a [build] target-dir in any
+# .cargo/config.toml above this directory sends cargo's output elsewhere while
+# IMPORTED_LOCATION below keeps pointing here. The build then succeeds and
+# silently links whatever stale library happens to be at this path. Both are
+# common on CI and on machines that centralise build output.
+add_custom_target(build_alt_df ALL
+    COMMAND ${CARGO_CMD} build --release
+            --manifest-path ${ALT_DF_DIR}/Cargo.toml
+            --target-dir ${ALT_DF_DIR}/target
+    WORKING_DIRECTORY ${ALT_DF_DIR}
     BYPRODUCTS ${TARGET_RELEASE_DIR}/${RUST_LIB_NAME}
-    COMMENT "###### Building libDF with Cargo... ######"
+    COMMENT "###### Building alt_df (DeepFilterNet shim) with Cargo... ######"
     VERBATIM
 )
 
 # STATIC
 add_library(df STATIC IMPORTED GLOBAL)
-add_dependencies(df build_libdf)
+add_dependencies(df build_alt_df)
 
 if(WIN32)
     # Windows
-    set_target_properties(df PROPERTIES IMPORTED_LOCATION "${TARGET_RELEASE_DIR}/df.lib")
+    set_target_properties(df PROPERTIES IMPORTED_LOCATION "${TARGET_RELEASE_DIR}/${RUST_LIB_NAME}")
     set(RUST_SYSTEM_LIBS
         Bcrypt.lib
         Userenv.lib
@@ -50,7 +72,7 @@ if(WIN32)
     )
 elseif(APPLE)
     # macOS
-    set_target_properties(df PROPERTIES IMPORTED_LOCATION "${TARGET_RELEASE_DIR}/libdf.a")
+    set_target_properties(df PROPERTIES IMPORTED_LOCATION "${TARGET_RELEASE_DIR}/${RUST_LIB_NAME}")
     find_library(SECURITY_FW Security)
     find_library(COREFOUNDATION_FW CoreFoundation)
     find_library(SYSTEMCONFIGURATION_FW SystemConfiguration)
@@ -63,7 +85,7 @@ elseif(APPLE)
     )
 else()
     # Linux
-    set_target_properties(df PROPERTIES IMPORTED_LOCATION "${TARGET_RELEASE_DIR}/libdf.a")
+    set_target_properties(df PROPERTIES IMPORTED_LOCATION "${TARGET_RELEASE_DIR}/${RUST_LIB_NAME}")
     set(RUST_SYSTEM_LIBS
         pthread
         dl
@@ -153,7 +175,7 @@ target_link_libraries(AltDenoiserPlugin PRIVATE
     juce::juce_gui_basics
     juce::juce_gui_extra
 )
-add_dependencies(AltDenoiserPlugin build_libdf)
+add_dependencies(AltDenoiserPlugin build_alt_df)
 
 # ---------------------------------------------------------------------------
 # Offline render harness.
@@ -203,4 +225,4 @@ target_link_libraries(AltDenoiserTests PRIVATE
     juce::juce_gui_basics
     juce::juce_gui_extra
 )
-add_dependencies(AltDenoiserTests build_libdf)
+add_dependencies(AltDenoiserTests build_alt_df)

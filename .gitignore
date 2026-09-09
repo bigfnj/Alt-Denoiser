@@ -1,8 +1,21 @@
 libs/libDF/*
 modules/*/target/
+libs/alt_df/target/
 build/
 build-*/
 bin/
 dist/
-*.dll *.lib *.a *.exp *.ilk *.pdb
+
+# One pattern per line. These used to be a single space-separated line, which
+# gitignore reads as ONE pattern matching a file literally named
+# "*.dll *.lib *.a *.exp *.ilk *.pdb", so none of these extensions were ignored
+# at all. Nothing leaked into the repo only because every build output already
+# lands under an ignored directory.
+*.dll
+*.lib
+*.a
+*.exp
+*.ilk
+*.pdb
+
 .DS_Store

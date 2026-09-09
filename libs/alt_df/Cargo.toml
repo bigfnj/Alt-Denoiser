@@ -1,0 +1,47 @@
+# A thin, non-panicking C ABI over DeepFilterNet's tract runtime.
+#
+# This REPLACES libDF's own `capi` feature rather than sitting beside it. Two
+# Rust staticlibs in one link line each carry their own copy of libstd, which
+# MSVC reports as LNK4006/LNK2005 duplicate symbols, so the plugin links exactly
+# one of them and it is this crate.
+#
+# Empty [workspace] on purpose: without it, adding a Cargo.toml at the repo root
+# later would silently absorb this crate into that workspace and move its target
+# directory, breaking the CMake IMPORTED_LOCATION.
+[workspace]
+
+[package]
+name = "alt_df"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Non-panicking C ABI over DeepFilterNet for Alt-Denoiser"
+
+[lib]
+name = "alt_df"
+crate-type = ["staticlib"]
+
+[dependencies]
+# default-features = false is load-bearing. libDF's defaults are
+# ["default-model", "vorbis", "flac"], and `default-model` embeds a whole
+# DeepFilterNet3 archive into the static library. The plugin already carries the
+# model as JUCE BinaryData, so the default would compile a second copy of it into
+# every object we link (BACKLOG.md M4). vorbis/flac pull lewton, ogg and claxon
+# for dataset decoding that no plugin path reaches.
+#
+# `tract` is the only feature we need; it transitively enables transforms and
+# logging, which is what DfTract and DfParams are gated on.
+deep_filter = { path = "../../modules/DeepFilterNet/libDF", default-features = false, features = ["tract"] }
+ndarray = "^0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+# panic MUST stay "unwind". Every entry point wraps its body in catch_unwind so a
+# panic inside tract becomes an error status instead of aborting the DAW, and
+# catch_unwind cannot catch anything under panic = "abort". lib.rs carries a
+# compile_error! that fires if this is ever changed, so the guarantee is checked
+# by the compiler rather than by this comment.
+panic = "unwind"

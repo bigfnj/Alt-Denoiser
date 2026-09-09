@@ -28,6 +28,8 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "DeepFilterNetProcessor.h"
+#include "BinaryData.h"
 
 namespace
 {
@@ -1029,6 +1031,208 @@ void testSimpleFifo()
 }
 
 //==============================================================================
+// T24-T26 / C1, C2, M3 - the alt_df shim.
+//
+// These tests could not be written against libDF's C API. Every failure there
+// was an .expect() inside an extern "C" function, so the failure mode was an
+// abort of the whole test process: not a red test, no output, no exit code to
+// inspect. "Reaching the next line" is the assertion.
+
+void testCorruptModelDegradesToBypass()
+{
+    std::vector<std::string> failures;
+    auto check = [&failures] (bool ok, const char* what)
+    {
+        if (! ok) failures.push_back (what);
+    };
+
+    const auto* good = reinterpret_cast<const uint8_t*> (
+                           AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gz);
+    const int goodSize = AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gzSize;
+
+    check (good != nullptr && goodSize > 4096, "the embedded model should be present");
+
+    // 1. Nothing at all.
+    {
+        DeepFilterNetProcessor p;
+        check (! p.initializeFromMemory (nullptr, 1024), "a null buffer should be refused");
+        check (! p.isReady(), "a refused load must leave the processor unusable");
+        check (p.getLastStatus() == ALT_DF_NULL_ARG, "a null buffer should report NULL_ARG");
+    }
+
+    // 2. Zero length.
+    {
+        DeepFilterNetProcessor p;
+        check (! p.initializeFromMemory (good, 0), "a zero-length buffer should be refused");
+        check (p.getLastStatus() == ALT_DF_NULL_ARG, "zero length should report NULL_ARG");
+    }
+
+    // 3. Random bytes. Not gzip, so this fails in the decompressor.
+    {
+        std::vector<uint8_t> garbage (8192);
+        juce::Random rng (12345);
+        for (auto& b : garbage) b = (uint8_t) rng.nextInt (256);
+
+        DeepFilterNetProcessor p;
+        check (! p.initializeFromMemory (garbage.data(), (int) garbage.size()),
+               "random bytes should be refused");
+        check (p.getLastStatus() == ALT_DF_BAD_MODEL, "random bytes should report BAD_MODEL");
+    }
+
+    // 4. A TRUNCATED copy of the real archive. This is the one that matters:
+    //    the gzip header is valid, so the failure happens deep inside the tar
+    //    reader rather than at the first byte. It is exactly what a short write
+    //    to the old temp file produced, and it used to abort the host.
+    {
+        DeepFilterNetProcessor p;
+        check (! p.initializeFromMemory (good, goodSize / 2),
+               "a truncated archive should be refused");
+        const auto st = p.getLastStatus();
+        check (st == ALT_DF_BAD_MODEL || st == ALT_DF_INIT,
+               "a truncated archive should report BAD_MODEL or INIT");
+    }
+
+    // 5. A valid gzip stream that is not a DeepFilterNet archive: the first
+    //    32 KB of the real file's *decompressed* content is not reachable
+    //    without inflating, so use a gzip of something else entirely. A gzip
+    //    member of a single stored empty tar is the cheapest such thing, and
+    //    the point is that the archive parses but yields no enc.onnx.
+    {
+        juce::MemoryBlock gz;
+        {
+            juce::MemoryOutputStream raw (gz, false);
+            juce::GZIPCompressorOutputStream zip (raw, 6);
+            const std::vector<char> emptyTar (1024, 0);   // two zero blocks = end of archive
+            zip.write (emptyTar.data(), emptyTar.size());
+            zip.flush();
+        }
+
+        DeepFilterNetProcessor p;
+        check (! p.initializeFromMemory (gz.getData(), (int) gz.getSize()),
+               "a gzip containing no model should be refused");
+        check (p.getLastStatus() == ALT_DF_BAD_MODEL || p.getLastStatus() == ALT_DF_INIT,
+               "an empty archive should report BAD_MODEL or INIT");
+    }
+
+    // 6. After all of that, a good load must still work. A failed attempt
+    //    cannot poison the object: release() runs first on every path.
+    {
+        DeepFilterNetProcessor p;
+        check (! p.initializeFromMemory (good, 64), "a 64-byte archive should be refused");
+        check (p.initialize(), "the real model should load after a refused one");
+        check (p.isReady(), "the real model should report ready");
+        check (p.getFrameLength() == 480, "the loaded model should report a 480-sample hop");
+    }
+
+    const std::string detail = failures.empty()
+        ? std::string ("six malformed archives refused, process still alive, good load after")
+        : (std::to_string (failures.size()) + " failed: " + failures.front());
+    record ("corrupt model degrades to bypass", "C1/C2", failures.empty(), Expect::Pass, detail);
+}
+
+void testModelMetadataIsReported()
+{
+    // libDF's C API exposed only the hop size, which is why the plugin's
+    // reported latency had to be the hardcoded 1920. alt_df_info reports the
+    // whole geometry, so it can be derived. This test pins the derivation
+    // against the model that is actually embedded.
+
+    DeepFilterNetProcessor p;
+    const bool loaded = p.initialize();
+    const auto& info = p.getInfo();
+
+    const int modelDelay = p.getModelDelaySamples();
+    const int derived    = modelDelay + (int) info.hop_size;   // + the plugin's own cushion
+
+    const bool passed = loaded
+                     && info.sr == 48000u
+                     && info.hop_size == 480u
+                     && info.fft_size == 960u
+                     && info.lookahead == 2u
+                     && info.ch == 1u
+                     && modelDelay == 1440
+                     && derived == 1920;
+
+    record ("model metadata is reported", "C2", passed, Expect::Pass,
+            "sr " + std::to_string (info.sr)
+              + ", hop " + std::to_string (info.hop_size)
+              + ", fft " + std::to_string (info.fft_size)
+              + ", lookahead " + std::to_string (info.lookahead)
+              + ", ch " + std::to_string (info.ch)
+              + " -> model delay " + std::to_string (modelDelay)
+              + ", derived latency " + std::to_string (derived) + " (want 1920)");
+}
+
+void testWrongFrameLengthIsRefused()
+{
+    // M3. libDF's df_process_frame built its ndarray views with from_shape_ptr,
+    // which performs no bounds check, and libDF's only guard was a
+    // debug_assert compiled out in release. Handing it a buffer shorter than
+    // the model's hop was therefore a silent heap read past the end, not an
+    // error. alt_df range-checks the lengths before dereferencing anything.
+    //
+    // Called through the C API directly: the C++ wrapper always passes the
+    // model's own hop, so the guard is unreachable from there by construction.
+
+    std::vector<std::string> failures;
+    auto check = [&failures] (bool ok, const char* what)
+    {
+        if (! ok) failures.push_back (what);
+    };
+
+    AltDf* st = nullptr;
+    const auto created = alt_df_create (
+        reinterpret_cast<const uint8_t*> (AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gz),
+        (size_t) AltDenoiserBinaryData::DeepFilterNet3_onnx_tar_gzSize,
+        100.0f, &st);
+
+    check (created == ALT_DF_OK && st != nullptr, "the model should load");
+
+    if (st != nullptr)
+    {
+        AltDfInfo info {};
+        check (alt_df_info (st, &info) == ALT_DF_OK, "info should succeed");
+
+        std::vector<float> in ((size_t) info.hop_size, 0.1f);
+        std::vector<float> out ((size_t) info.hop_size, 0.0f);
+        const size_t hop = (size_t) info.hop_size;
+
+        check (alt_df_process_frame (st, in.data(), hop - 1, out.data(), hop, nullptr)
+                   == ALT_DF_BAD_LENGTH, "a short input length should be refused");
+        check (alt_df_process_frame (st, in.data(), hop, out.data(), hop - 1, nullptr)
+                   == ALT_DF_BAD_LENGTH, "a short output length should be refused");
+        check (alt_df_process_frame (st, in.data(), hop + 1, out.data(), hop, nullptr)
+                   == ALT_DF_BAD_LENGTH, "an over-long input length should be refused");
+        check (alt_df_process_frame (st, nullptr, hop, out.data(), hop, nullptr)
+                   == ALT_DF_NULL_ARG, "a null input should be refused");
+        check (alt_df_process_frame (nullptr, in.data(), hop, out.data(), hop, nullptr)
+                   == ALT_DF_NULL_ARG, "a null state should be refused");
+
+        // The correct call must still work after all those refusals, and must
+        // actually write something.
+        float lsnr = -999.0f;
+        check (alt_df_process_frame (st, in.data(), hop, out.data(), hop, &lsnr) == ALT_DF_OK,
+               "a correctly sized frame should succeed");
+        check (lsnr > -900.0f, "the local SNR should have been written");
+
+        alt_df_free (st);
+    }
+
+    // Freeing null must be a no-op, not a crash.
+    alt_df_free (nullptr);
+
+    // Every status must have a description; a missing arm would be a null deref
+    // in the DBG path exactly when something has already gone wrong.
+    for (int s = ALT_DF_OK; s <= ALT_DF_PANIC; ++s)
+        check (alt_df_status_str ((AltDfStatus) s) != nullptr, "every status needs a description");
+
+    const std::string detail = failures.empty()
+        ? std::string ("short, long, and null arguments all refused; correct call still works")
+        : (std::to_string (failures.size()) + " failed: " + failures.front());
+    record ("wrong frame length is refused", "M3", failures.empty(), Expect::Pass, detail);
+}
+
+//==============================================================================
 // T20 / M7 - bypass must be latency-aligned, exposed, and click-free.
 
 void setBypass (AltDenoiserProcessor& proc, bool on)
@@ -1199,6 +1403,9 @@ int main (int argc, char** argv)
     testBypassPreservesStereo();
     testBypassToggleDoesNotClick();
     testBypassParameterIsExposedAndSaved();
+    testCorruptModelDegradesToBypass();
+    testModelMetadataIsReported();
+    testWrongFrameLengthIsRefused();
 
     int unexpected = 0;
     for (const auto& r : results)

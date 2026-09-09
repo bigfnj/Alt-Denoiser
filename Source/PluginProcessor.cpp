@@ -8,7 +8,10 @@ AltDenoiserProcessor::AltDenoiserProcessor()
         .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
       apvts(*this, nullptr, "Parameters", createParameterLayout())
 {
-    dfProcessor = std::make_unique<DeepFilterNetProcessor>(48000);
+    // The old constructor took a sample rate that nothing ever read: the model
+    // is fixed at its own rate and the resampler owns the conversion. Dropped
+    // along with the rest of the class's rewrite.
+    dfProcessor = std::make_unique<DeepFilterNetProcessor>();
 
     // L5: cached once. This was a string-keyed hash and lookup on the audio
     // thread every single block.
